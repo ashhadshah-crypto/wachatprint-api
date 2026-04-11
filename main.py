@@ -1,17 +1,12 @@
 from io import BytesIO
-import os
+import html
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.colors import HexColor, white
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas
+from playwright.sync_api import sync_playwright
 
 
 app = FastAPI(title="WAChatPrint API")
@@ -29,29 +24,6 @@ app.add_middleware(
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
-# ---------- Font setup ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FONT_DIR = os.path.join(BASE_DIR, "fonts")
-
-TEXT_FONT_PATH = os.path.join(FONT_DIR, "DejaVuSans.ttf")
-BOLD_FONT_PATH = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
-EMOJI_FONT_PATH = os.path.join(FONT_DIR, "Symbola.ttf")
-
-REQUIRED_FONTS = [TEXT_FONT_PATH, BOLD_FONT_PATH, EMOJI_FONT_PATH]
-for font_path in REQUIRED_FONTS:
-    if not os.path.exists(font_path):
-        raise RuntimeError(f"Missing required font file: {font_path}")
-
-TEXT_FONT = "ChatText"
-BOLD_FONT = "ChatBold"
-EMOJI_FONT = "ChatEmoji"
-
-pdfmetrics.registerFont(TTFont(TEXT_FONT, TEXT_FONT_PATH))
-pdfmetrics.registerFont(TTFont(BOLD_FONT, BOLD_FONT_PATH))
-pdfmetrics.registerFont(TTFont(EMOJI_FONT, EMOJI_FONT_PATH))
-
-
-# ---------- WhatsApp patterns ----------
 PATTERN_BRACKET = re.compile(
     r"^\[(?P<date>[^,\]]+),\s*(?P<time>[^\]]+)\]\s*(?P<rest>.+)$"
 )
@@ -71,81 +43,6 @@ def health():
     return {"status": "ok"}
 
 
-def is_emoji_char(ch: str) -> bool:
-    if not ch:
-        return False
-
-    code = ord(ch)
-
-    emoji_ranges = [
-        (0x1F300, 0x1F5FF),  # Misc Symbols and Pictographs
-        (0x1F600, 0x1F64F),  # Emoticons
-        (0x1F680, 0x1F6FF),  # Transport and Map
-        (0x1F700, 0x1F77F),  # Alchemical Symbols
-        (0x1F780, 0x1F7FF),  # Geometric Shapes Extended
-        (0x1F800, 0x1F8FF),  # Supplemental Arrows-C
-        (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
-        (0x1FA00, 0x1FA6F),  # Chess / symbols
-        (0x1FA70, 0x1FAFF),  # Symbols and Pictographs Extended-A
-        (0x2600, 0x26FF),    # Misc symbols
-        (0x2700, 0x27BF),    # Dingbats
-        (0x1F1E6, 0x1F1FF),  # Regional indicator flags
-        (0xFE00, 0xFE0F),    # Variation selectors
-        (0x200D, 0x200D),    # Zero-width joiner
-    ]
-
-    return any(start <= code <= end for start, end in emoji_ranges)
-
-
-def font_for_char(ch: str, base_font: str) -> str:
-    return EMOJI_FONT if is_emoji_char(ch) else base_font
-
-
-def mixed_text_width(text: str, base_font: str, font_size: int) -> float:
-    total = 0.0
-    for ch in text:
-        active_font = font_for_char(ch, base_font)
-        try:
-            total += pdfmetrics.stringWidth(ch, active_font, font_size)
-        except Exception:
-            total += pdfmetrics.stringWidth("?", base_font, font_size)
-    return total
-
-
-def draw_mixed_text(pdf: canvas.Canvas, x: float, y: float, text: str, base_font: str, font_size: int):
-    if not text:
-        return
-
-    current_font = font_for_char(text[0], base_font)
-    run = ""
-    current_x = x
-
-    for ch in text:
-        active_font = font_for_char(ch, base_font)
-        if active_font == current_font:
-            run += ch
-        else:
-            pdf.setFont(current_font, font_size)
-            pdf.drawString(current_x, y, run)
-            current_x += pdfmetrics.stringWidth(run, current_font, font_size)
-            run = ch
-            current_font = active_font
-
-    if run:
-        pdf.setFont(current_font, font_size)
-        pdf.drawString(current_x, y, run)
-
-
-def draw_mixed_text_right(pdf: canvas.Canvas, right_x: float, y: float, text: str, base_font: str, font_size: int):
-    width = mixed_text_width(text, base_font, font_size)
-    draw_mixed_text(pdf, right_x - width, y, text, base_font, font_size)
-
-
-def draw_mixed_text_center(pdf: canvas.Canvas, center_x: float, y: float, text: str, base_font: str, font_size: int):
-    width = mixed_text_width(text, base_font, font_size)
-    draw_mixed_text(pdf, center_x - (width / 2), y, text, base_font, font_size)
-
-
 def split_sender_and_message(rest: str):
     if ": " in rest:
         sender, message = rest.split(": ", 1)
@@ -156,6 +53,7 @@ def split_sender_and_message(rest: str):
 def parse_whatsapp_text(text: str) -> List[Dict]:
     messages: List[Dict] = []
     sender_side_map: Dict[str, str] = {}
+    last_date = None
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
@@ -181,8 +79,18 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
             else:
                 side = "center"
 
+            if date != last_date:
+                messages.append(
+                    {
+                        "type": "date_separator",
+                        "date": date,
+                    }
+                )
+                last_date = date
+
             messages.append(
                 {
+                    "type": "message",
                     "date": date,
                     "time": time,
                     "sender": sender,
@@ -193,13 +101,18 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
             )
         else:
             if messages:
-                if messages[-1]["message"]:
-                    messages[-1]["message"] += "\n" + line
-                else:
-                    messages[-1]["message"] = line
+                # append to last real message
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("type") == "message":
+                        if messages[i]["message"]:
+                            messages[i]["message"] += "\n" + line
+                        else:
+                            messages[i]["message"] = line
+                        break
             else:
                 messages.append(
                     {
+                        "type": "message",
                         "date": "",
                         "time": "",
                         "sender": None,
@@ -212,146 +125,232 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
     return messages
 
 
-def wrap_text(text: str, max_width: float, base_font: str, font_size: int) -> List[str]:
-    if not text:
-        return [""]
+def format_message_html(text: str) -> str:
+    safe = html.escape(text)
+    return safe.replace("\n", "<br>")
 
-    paragraphs = text.split("\n")
-    final_lines: List[str] = []
 
-    for para in paragraphs:
-        para = para.strip()
+def build_chat_html(source_name: str, items: List[Dict]) -> str:
+    chunks: List[str] = []
 
-        if para == "":
-            final_lines.append("")
+    for item in items:
+        if item["type"] == "date_separator":
+            chunks.append(
+                f"""
+                <div class="date-separator-wrap">
+                  <div class="date-separator">{html.escape(item["date"])}</div>
+                </div>
+                """
+            )
             continue
 
-        words = para.split()
-        if not words:
-            final_lines.append("")
+        msg = item
+
+        if msg["is_system"]:
+            chunks.append(
+                f"""
+                <div class="system-wrap">
+                  <div class="system-message">
+                    <div class="system-text">{format_message_html(msg["message"])}</div>
+                    <div class="system-time">{html.escape(msg["time"] or "")}</div>
+                  </div>
+                </div>
+                """
+            )
             continue
 
-        current_line = words[0]
+        side_class = "left" if msg["side"] == "left" else "right"
+        sender_html = (
+            f'<div class="sender">{html.escape(msg["sender"])}</div>'
+            if msg["sender"]
+            else ""
+        )
 
-        for word in words[1:]:
-            test_line = f"{current_line} {word}"
-            if mixed_text_width(test_line, base_font, font_size) <= max_width:
-                current_line = test_line
-            else:
-                final_lines.append(current_line)
-                current_line = word
+        chunks.append(
+            f"""
+            <div class="msg-row {side_class}">
+              <div class="bubble {side_class}">
+                {sender_html}
+                <div class="message-text">{format_message_html(msg["message"])}</div>
+                <div class="meta">{html.escape(msg["time"] or "")}</div>
+              </div>
+            </div>
+            """
+        )
 
-        final_lines.append(current_line)
+    chat_body = "\n".join(chunks)
 
-    return final_lines
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{html.escape(source_name)}</title>
+  <style>
+    @page {{
+      size: A4;
+      margin: 12mm 10mm 14mm 10mm;
+    }}
 
+    * {{
+      box-sizing: border-box;
+    }}
 
-def draw_page_background(pdf: canvas.Canvas, width: float, height: float, page_num: int):
-    pdf.setFillColor(HexColor("#efeae2"))
-    pdf.rect(0, 0, width, height, fill=1, stroke=0)
+    body {{
+      margin: 0;
+      font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
+                   "Segoe UI", Arial, sans-serif;
+      background: #efeae2;
+      color: #111827;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }}
 
-    pdf.setFillColor(HexColor("#0f8f7d"))
-    pdf.rect(0, height - 42, width, 42, fill=1, stroke=0)
+    .page {{
+      width: 100%;
+    }}
 
-    pdf.setFillColor(white)
-    draw_mixed_text(pdf, 24, height - 27, "WAChatPrint", BOLD_FONT, 14)
+    .topbar {{
+      background: #0f8f7d;
+      color: white;
+      padding: 14px 16px;
+      font-weight: 700;
+      font-size: 18px;
+      border-radius: 10px;
+      margin-bottom: 12px;
+    }}
 
-    pdf.setFillColor(HexColor("#6b7280"))
-    draw_mixed_text_right(pdf, width - 24, 16, f"Page {page_num}", TEXT_FONT, 9)
+    .chat-card {{
+      background: rgba(255,255,255,0.28);
+      border-radius: 14px;
+      padding: 10px;
+    }}
 
+    .chat-title {{
+      background: white;
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      font-size: 13px;
+      color: #374151;
+    }}
 
-def draw_header(pdf: canvas.Canvas, width: float, y_top: float, source_name: str, first_date: str, last_date: str):
-    y = y_top
+    .chat-title strong {{
+      color: #111827;
+      font-size: 14px;
+    }}
 
-    pdf.setFillColor(HexColor("#ffffff"))
-    pdf.roundRect(24, y - 42, width - 48, 36, 10, fill=1, stroke=0)
+    .date-separator-wrap,
+    .system-wrap {{
+      text-align: center;
+      margin: 12px 0;
+    }}
 
-    pdf.setFillColor(HexColor("#111827"))
-    draw_mixed_text(pdf, 36, y - 22, source_name, BOLD_FONT, 12)
+    .date-separator {{
+      display: inline-block;
+      background: #dbeafe;
+      color: #1d4ed8;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }}
 
-    pdf.setFillColor(HexColor("#6b7280"))
-    date_range = f"{first_date}  →  {last_date}" if first_date or last_date else "Imported chat"
-    draw_mixed_text_right(pdf, width - 36, y - 22, date_range, TEXT_FONT, 9)
+    .system-message {{
+      display: inline-block;
+      max-width: 70%;
+      background: #d1d5db;
+      color: #374151;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 12px;
+      line-height: 1.5;
+    }}
 
-    return y - 54
+    .system-time {{
+      margin-top: 4px;
+      font-size: 10px;
+      color: #6b7280;
+    }}
 
+    .msg-row {{
+      display: flex;
+      margin: 8px 0;
+      width: 100%;
+    }}
 
-def message_bubble_height(lines: List[str], include_sender: bool) -> float:
-    top_pad = 8
-    bottom_pad = 8
-    sender_h = 12 if include_sender else 0
-    line_h = 12 * max(1, len(lines))
-    time_h = 11
-    return top_pad + sender_h + line_h + time_h + bottom_pad
+    .msg-row.left {{
+      justify-content: flex-start;
+    }}
 
+    .msg-row.right {{
+      justify-content: flex-end;
+    }}
 
-def draw_message_bubble(pdf: canvas.Canvas, width: float, y_top: float, msg: Dict):
-    page_margin = 24
-    bubble_max_width = 290
-    text_font = TEXT_FONT
-    text_size = 10
-    sender_font = BOLD_FONT
-    sender_size = 9
-    time_font = TEXT_FONT
-    time_size = 8
-    padding_x = 10
-    padding_y = 8
+    .bubble {{
+      max-width: 72%;
+      padding: 8px 10px 6px;
+      border-radius: 12px;
+      box-shadow: 0 1px 1px rgba(0,0,0,0.08);
+      line-height: 1.5;
+      word-break: break-word;
+      white-space: normal;
+    }}
 
-    if msg["is_system"]:
-        box_width = width - 160
-        x = (width - box_width) / 2
-        lines = wrap_text(msg["message"], box_width - (padding_x * 2), text_font, text_size)
-        height_needed = message_bubble_height(lines, include_sender=False)
+    .bubble.left {{
+      background: white;
+      border-top-left-radius: 4px;
+    }}
 
-        y_bottom = y_top - height_needed
+    .bubble.right {{
+      background: #dcf8c6;
+      border-top-right-radius: 4px;
+    }}
 
-        pdf.setFillColor(HexColor("#d1d5db"))
-        pdf.roundRect(x, y_bottom, box_width, height_needed, 8, fill=1, stroke=0)
+    .sender {{
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: #2563eb;
+    }}
 
-        cursor_y = y_top - padding_y - 10
-        pdf.setFillColor(HexColor("#374151"))
-        for line in lines:
-            draw_mixed_text_center(pdf, width / 2, cursor_y, line if line else " ", text_font, text_size)
-            cursor_y -= 12
+    .bubble.right .sender {{
+      color: #0f8f7d;
+    }}
 
-        if msg["time"]:
-            pdf.setFillColor(HexColor("#6b7280"))
-            draw_mixed_text_center(pdf, width / 2, y_bottom + 6, msg["time"], time_font, time_size)
+    .message-text {{
+      font-size: 13px;
+      color: #111827;
+    }}
 
-        return y_bottom - 8
+    .meta {{
+      margin-top: 4px;
+      text-align: right;
+      font-size: 10px;
+      color: #6b7280;
+    }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">WAChatPrint</div>
 
-    side = msg["side"]
-    bubble_width = bubble_max_width
+    <div class="chat-card">
+      <div class="chat-title">
+        <div><strong>{html.escape(source_name)}</strong></div>
+        <div>Exported WhatsApp chat → PDF</div>
+      </div>
 
-    lines = wrap_text(msg["message"], bubble_width - (padding_x * 2), text_font, text_size)
-    include_sender = bool(msg["sender"])
-    height_needed = message_bubble_height(lines, include_sender=include_sender)
-
-    x = page_margin if side == "left" else width - page_margin - bubble_width
-    y_bottom = y_top - height_needed
-
-    fill_color = HexColor("#ffffff") if side == "left" else HexColor("#dcf8c6")
-    pdf.setFillColor(fill_color)
-    pdf.roundRect(x, y_bottom, bubble_width, height_needed, 10, fill=1, stroke=0)
-
-    cursor_y = y_top - padding_y - 9
-
-    if include_sender:
-      sender_color = HexColor("#2563eb") if side == "left" else HexColor("#0f8f7d")
-      pdf.setFillColor(sender_color)
-      draw_mixed_text(pdf, x + padding_x, cursor_y, msg["sender"][:36], sender_font, sender_size)
-      cursor_y -= 12
-
-    pdf.setFillColor(HexColor("#111827"))
-    for line in lines:
-        draw_mixed_text(pdf, x + padding_x, cursor_y, line if line else " ", text_font, text_size)
-        cursor_y -= 12
-
-    if msg["time"]:
-        pdf.setFillColor(HexColor("#6b7280"))
-        draw_mixed_text_right(pdf, x + bubble_width - padding_x, y_bottom + 6, msg["time"], time_font, time_size)
-
-    return y_bottom - 10
+      {chat_body}
+    </div>
+  </div>
+</body>
+</html>
+    """
 
 
 @app.post("/convert-txt")
@@ -374,42 +373,39 @@ async def convert_txt(file: UploadFile = File(...)):
         except UnicodeDecodeError:
             text = content.decode("latin-1", errors="ignore")
 
-    messages = parse_whatsapp_text(text)
+    items = parse_whatsapp_text(text)
 
-    if not messages:
+    if not items:
         raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
 
     source_name = filename.rsplit(".", 1)[0]
-    first_date = messages[0]["date"] if messages else ""
-    last_date = messages[-1]["date"] if messages else ""
+    html_content = build_chat_html(source_name, items)
 
-    pdf_buffer = BytesIO()
-    pdf = canvas.Canvas(pdf_buffer, pagesize=A4)
-    width, height = A4
-
-    page_num = 1
-    draw_page_background(pdf, width, height, page_num)
-    y = draw_header(pdf, width, height - 12, source_name, first_date, last_date)
-
-    for msg in messages:
-        preview_lines = wrap_text(msg["message"], 270, TEXT_FONT, 10)
-        need_height = message_bubble_height(preview_lines, include_sender=bool(msg["sender"])) + 14
-
-        if y - need_height < 30:
-            pdf.showPage()
-            page_num += 1
-            draw_page_background(pdf, width, height, page_num)
-            y = draw_header(pdf, width, height - 12, source_name, first_date, last_date)
-
-        y = draw_message_bubble(pdf, width, y, msg)
-
-    pdf.save()
-    pdf_buffer.seek(0)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        page = browser.new_page()
+        page.set_content(html_content, wait_until="load")
+        page.emulate_media(media="screen")
+        pdf_bytes = page.pdf(
+            format="A4",
+            print_background=True,
+            margin={
+                "top": "10mm",
+                "right": "8mm",
+                "bottom": "12mm",
+                "left": "8mm",
+            },
+            prefer_css_page_size=True,
+        )
+        browser.close()
 
     output_name = filename.rsplit(".", 1)[0] + ".pdf"
 
     return StreamingResponse(
-        pdf_buffer,
+        BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
     )
