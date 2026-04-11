@@ -1,6 +1,7 @@
 from io import BytesIO
+import os
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +9,8 @@ from fastapi.responses import StreamingResponse
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.colors import HexColor, white
-from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 
@@ -27,7 +29,29 @@ app.add_middleware(
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
-# Common WhatsApp export patterns
+# ---------- Font setup ----------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
+
+TEXT_FONT_PATH = os.path.join(FONT_DIR, "DejaVuSans.ttf")
+BOLD_FONT_PATH = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
+EMOJI_FONT_PATH = os.path.join(FONT_DIR, "Symbola.ttf")
+
+REQUIRED_FONTS = [TEXT_FONT_PATH, BOLD_FONT_PATH, EMOJI_FONT_PATH]
+for font_path in REQUIRED_FONTS:
+    if not os.path.exists(font_path):
+        raise RuntimeError(f"Missing required font file: {font_path}")
+
+TEXT_FONT = "ChatText"
+BOLD_FONT = "ChatBold"
+EMOJI_FONT = "ChatEmoji"
+
+pdfmetrics.registerFont(TTFont(TEXT_FONT, TEXT_FONT_PATH))
+pdfmetrics.registerFont(TTFont(BOLD_FONT, BOLD_FONT_PATH))
+pdfmetrics.registerFont(TTFont(EMOJI_FONT, EMOJI_FONT_PATH))
+
+
+# ---------- WhatsApp patterns ----------
 PATTERN_BRACKET = re.compile(
     r"^\[(?P<date>[^,\]]+),\s*(?P<time>[^\]]+)\]\s*(?P<rest>.+)$"
 )
@@ -47,12 +71,82 @@ def health():
     return {"status": "ok"}
 
 
+def is_emoji_char(ch: str) -> bool:
+    if not ch:
+        return False
+
+    code = ord(ch)
+
+    emoji_ranges = [
+        (0x1F300, 0x1F5FF),  # Misc Symbols and Pictographs
+        (0x1F600, 0x1F64F),  # Emoticons
+        (0x1F680, 0x1F6FF),  # Transport and Map
+        (0x1F700, 0x1F77F),  # Alchemical Symbols
+        (0x1F780, 0x1F7FF),  # Geometric Shapes Extended
+        (0x1F800, 0x1F8FF),  # Supplemental Arrows-C
+        (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
+        (0x1FA00, 0x1FA6F),  # Chess / symbols
+        (0x1FA70, 0x1FAFF),  # Symbols and Pictographs Extended-A
+        (0x2600, 0x26FF),    # Misc symbols
+        (0x2700, 0x27BF),    # Dingbats
+        (0x1F1E6, 0x1F1FF),  # Regional indicator flags
+        (0xFE00, 0xFE0F),    # Variation selectors
+        (0x200D, 0x200D),    # Zero-width joiner
+    ]
+
+    return any(start <= code <= end for start, end in emoji_ranges)
+
+
+def font_for_char(ch: str, base_font: str) -> str:
+    return EMOJI_FONT if is_emoji_char(ch) else base_font
+
+
+def mixed_text_width(text: str, base_font: str, font_size: int) -> float:
+    total = 0.0
+    for ch in text:
+        active_font = font_for_char(ch, base_font)
+        try:
+            total += pdfmetrics.stringWidth(ch, active_font, font_size)
+        except Exception:
+            total += pdfmetrics.stringWidth("?", base_font, font_size)
+    return total
+
+
+def draw_mixed_text(pdf: canvas.Canvas, x: float, y: float, text: str, base_font: str, font_size: int):
+    if not text:
+        return
+
+    current_font = font_for_char(text[0], base_font)
+    run = ""
+    current_x = x
+
+    for ch in text:
+        active_font = font_for_char(ch, base_font)
+        if active_font == current_font:
+            run += ch
+        else:
+            pdf.setFont(current_font, font_size)
+            pdf.drawString(current_x, y, run)
+            current_x += pdfmetrics.stringWidth(run, current_font, font_size)
+            run = ch
+            current_font = active_font
+
+    if run:
+        pdf.setFont(current_font, font_size)
+        pdf.drawString(current_x, y, run)
+
+
+def draw_mixed_text_right(pdf: canvas.Canvas, right_x: float, y: float, text: str, base_font: str, font_size: int):
+    width = mixed_text_width(text, base_font, font_size)
+    draw_mixed_text(pdf, right_x - width, y, text, base_font, font_size)
+
+
+def draw_mixed_text_center(pdf: canvas.Canvas, center_x: float, y: float, text: str, base_font: str, font_size: int):
+    width = mixed_text_width(text, base_font, font_size)
+    draw_mixed_text(pdf, center_x - (width / 2), y, text, base_font, font_size)
+
+
 def split_sender_and_message(rest: str):
-    """
-    WhatsApp lines may look like:
-    John Doe: Hello
-    Messages to this group are now secured...
-    """
     if ": " in rest:
         sender, message = rest.split(": ", 1)
         return sender.strip(), message.strip(), False
@@ -63,13 +157,10 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
     messages: List[Dict] = []
     sender_side_map: Dict[str, str] = {}
 
-    lines = text.splitlines()
-
-    for raw_line in lines:
+    for raw_line in text.splitlines():
         line = raw_line.rstrip()
 
         if not line.strip():
-            # keep paragraph spacing by appending blank line to previous message
             if messages:
                 messages[-1]["message"] += "\n"
             continue
@@ -101,7 +192,6 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
                 }
             )
         else:
-            # continuation of previous message
             if messages:
                 if messages[-1]["message"]:
                     messages[-1]["message"] += "\n" + line
@@ -122,10 +212,7 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
     return messages
 
 
-def wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> List[str]:
-    """
-    Wraps text while preserving paragraphs.
-    """
+def wrap_text(text: str, max_width: float, base_font: str, font_size: int) -> List[str]:
     if not text:
         return [""]
 
@@ -134,6 +221,7 @@ def wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> Li
 
     for para in paragraphs:
         para = para.strip()
+
         if para == "":
             final_lines.append("")
             continue
@@ -143,37 +231,33 @@ def wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> Li
             final_lines.append("")
             continue
 
-        current = words[0]
+        current_line = words[0]
+
         for word in words[1:]:
-            test = f"{current} {word}"
-            if stringWidth(test, font_name, font_size) <= max_width:
-                current = test
+            test_line = f"{current_line} {word}"
+            if mixed_text_width(test_line, base_font, font_size) <= max_width:
+                current_line = test_line
             else:
-                final_lines.append(current)
-                current = word
-        final_lines.append(current)
+                final_lines.append(current_line)
+                current_line = word
+
+        final_lines.append(current_line)
 
     return final_lines
 
 
 def draw_page_background(pdf: canvas.Canvas, width: float, height: float, page_num: int):
-    # page background
     pdf.setFillColor(HexColor("#efeae2"))
     pdf.rect(0, 0, width, height, fill=1, stroke=0)
 
-    # top bar
     pdf.setFillColor(HexColor("#0f8f7d"))
     pdf.rect(0, height - 42, width, 42, fill=1, stroke=0)
 
     pdf.setFillColor(white)
-    pdf.setFont("Helvetica-Bold", 14)
-    pdf.drawString(24, height - 27, "WAChatPrint")
+    draw_mixed_text(pdf, 24, height - 27, "WAChatPrint", BOLD_FONT, 14)
 
-    # footer
     pdf.setFillColor(HexColor("#6b7280"))
-    pdf.setFont("Helvetica", 9)
-    footer_text = f"Page {page_num}"
-    pdf.drawRightString(width - 24, 16, footer_text)
+    draw_mixed_text_right(pdf, width - 24, 16, f"Page {page_num}", TEXT_FONT, 9)
 
 
 def draw_header(pdf: canvas.Canvas, width: float, y_top: float, source_name: str, first_date: str, last_date: str):
@@ -183,13 +267,11 @@ def draw_header(pdf: canvas.Canvas, width: float, y_top: float, source_name: str
     pdf.roundRect(24, y - 42, width - 48, 36, 10, fill=1, stroke=0)
 
     pdf.setFillColor(HexColor("#111827"))
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawString(36, y - 22, source_name)
+    draw_mixed_text(pdf, 36, y - 22, source_name, BOLD_FONT, 12)
 
-    pdf.setFont("Helvetica", 9)
     pdf.setFillColor(HexColor("#6b7280"))
     date_range = f"{first_date}  →  {last_date}" if first_date or last_date else "Imported chat"
-    pdf.drawRightString(width - 36, y - 22, date_range)
+    draw_mixed_text_right(pdf, width - 36, y - 22, date_range, TEXT_FONT, 9)
 
     return y - 54
 
@@ -203,19 +285,14 @@ def message_bubble_height(lines: List[str], include_sender: bool) -> float:
     return top_pad + sender_h + line_h + time_h + bottom_pad
 
 
-def draw_message_bubble(
-    pdf: canvas.Canvas,
-    width: float,
-    y_top: float,
-    msg: Dict,
-):
+def draw_message_bubble(pdf: canvas.Canvas, width: float, y_top: float, msg: Dict):
     page_margin = 24
     bubble_max_width = 290
-    text_font = "Helvetica"
+    text_font = TEXT_FONT
     text_size = 10
-    sender_font = "Helvetica-Bold"
+    sender_font = BOLD_FONT
     sender_size = 9
-    time_font = "Helvetica"
+    time_font = TEXT_FONT
     time_size = 8
     padding_x = 10
     padding_y = 8
@@ -233,15 +310,13 @@ def draw_message_bubble(
 
         cursor_y = y_top - padding_y - 10
         pdf.setFillColor(HexColor("#374151"))
-        pdf.setFont(text_font, text_size)
         for line in lines:
-            pdf.drawCentredString(width / 2, cursor_y, line if line else " ")
+            draw_mixed_text_center(pdf, width / 2, cursor_y, line if line else " ", text_font, text_size)
             cursor_y -= 12
 
         if msg["time"]:
-            pdf.setFont(time_font, time_size)
             pdf.setFillColor(HexColor("#6b7280"))
-            pdf.drawCentredString(width / 2, y_bottom + 6, msg["time"])
+            draw_mixed_text_center(pdf, width / 2, y_bottom + 6, msg["time"], time_font, time_size)
 
         return y_bottom - 8
 
@@ -262,22 +337,19 @@ def draw_message_bubble(
     cursor_y = y_top - padding_y - 9
 
     if include_sender:
-        sender_color = HexColor("#2563eb") if side == "left" else HexColor("#0f8f7d")
-        pdf.setFillColor(sender_color)
-        pdf.setFont(sender_font, sender_size)
-        pdf.drawString(x + padding_x, cursor_y, msg["sender"][:36])
-        cursor_y -= 12
+      sender_color = HexColor("#2563eb") if side == "left" else HexColor("#0f8f7d")
+      pdf.setFillColor(sender_color)
+      draw_mixed_text(pdf, x + padding_x, cursor_y, msg["sender"][:36], sender_font, sender_size)
+      cursor_y -= 12
 
     pdf.setFillColor(HexColor("#111827"))
-    pdf.setFont(text_font, text_size)
     for line in lines:
-        pdf.drawString(x + padding_x, cursor_y, line if line else " ")
+        draw_mixed_text(pdf, x + padding_x, cursor_y, line if line else " ", text_font, text_size)
         cursor_y -= 12
 
     if msg["time"]:
-        pdf.setFont(time_font, time_size)
         pdf.setFillColor(HexColor("#6b7280"))
-        pdf.drawRightString(x + bubble_width - padding_x, y_bottom + 6, msg["time"])
+        draw_mixed_text_right(pdf, x + bubble_width - padding_x, y_bottom + 6, msg["time"], time_font, time_size)
 
     return y_bottom - 10
 
@@ -320,8 +392,8 @@ async def convert_txt(file: UploadFile = File(...)):
     y = draw_header(pdf, width, height - 12, source_name, first_date, last_date)
 
     for msg in messages:
-        bubble_preview_lines = wrap_text(msg["message"], 270, "Helvetica", 10)
-        need_height = message_bubble_height(bubble_preview_lines, include_sender=bool(msg["sender"])) + 14
+        preview_lines = wrap_text(msg["message"], 270, TEXT_FONT, 10)
+        need_height = message_bubble_height(preview_lines, include_sender=bool(msg["sender"])) + 14
 
         if y - need_height < 30:
             pdf.showPage()
