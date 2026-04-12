@@ -6,8 +6,7 @@ from typing import List, Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from playwright.sync_api import sync_playwright
-
+from playwright.async_api import async_playwright
 
 app = FastAPI(title="WAChatPrint API")
 
