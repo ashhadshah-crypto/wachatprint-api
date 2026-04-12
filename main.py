@@ -5,8 +5,10 @@ import re
 import zipfile
 from typing import List, Dict
 from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import httpx
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from playwright.async_api import async_playwright
@@ -26,7 +28,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+ABSOLUTE_MAX_FILE_SIZE = 50 * 1024 * 1024  # hard system cap 50 MB
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 PATTERN_BRACKET = re.compile(
     r"^\[(?P<date>[^,\]]+),\s*(?P<time>[^\]]+)\]\s*(?P<rest>.+)$"
@@ -463,14 +469,128 @@ async def render_chunk_pdf(browser, source_name: str, chunk: List[Dict], chunk_n
         await page.close()
 
 
+async def get_authenticated_user(request: Request):
+    auth_header = request.headers.get("authorization", "")
+
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Login required.")
+
+    access_token = auth_header.split(" ", 1)[1].strip()
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
+
+    return response.json()
+
+
+async def get_user_profile(user_id: str):
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={
+                "id": f"eq.{user_id}",
+                "select": "plan,max_file_size_mb,daily_conversion_limit",
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Could not read plan profile.")
+
+    rows = response.json()
+    if not rows:
+        return {
+            "plan": "free",
+            "max_file_size_mb": 5,
+            "daily_conversion_limit": 2,
+        }
+
+    return rows[0]
+
+
+async def get_usage_count_last_24h(user_id: str) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/conversion_usage",
+            params={
+                "user_id": f"eq.{user_id}",
+                "created_at": f"gte.{since.isoformat()}",
+                "select": "id",
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Could not read usage history.")
+
+    return len(response.json())
+
+
+async def record_usage_event(user_id: str):
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/conversion_usage",
+            json={"user_id": user_id},
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+
+    if response.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail="Could not record usage.")
+
+
 @app.post("/convert-txt")
-async def convert_txt(file: UploadFile = File(...)):
+async def convert_txt(request: Request, file: UploadFile = File(...)):
     try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_ROLE_KEY:
+            raise HTTPException(status_code=500, detail="Backend pricing config is missing.")
+
         filename = file.filename or ""
         content = await file.read()
 
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File is too large. Max 5 MB allowed.")
+        if len(content) > ABSOLUTE_MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="Current system max is 50 MB.")
+
+        user = await get_authenticated_user(request)
+        profile = await get_user_profile(user["id"])
+        used_today = await get_usage_count_last_24h(user["id"])
+
+        max_bytes = int(profile["max_file_size_mb"]) * 1024 * 1024
+        daily_limit = int(profile["daily_conversion_limit"])
+        plan_name = profile["plan"]
+
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{plan_name.capitalize()} plan limit is {profile['max_file_size_mb']} MB."
+            )
+
+        if used_today >= daily_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"{plan_name.capitalize()} plan limit reached: {daily_limit} conversions per 24 hours."
+            )
 
         source_name, text = extract_chat_text(filename, content)
         items = parse_whatsapp_text(text)
@@ -501,6 +621,8 @@ async def convert_txt(file: UploadFile = File(...)):
         output_buffer = BytesIO()
         writer.write(output_buffer)
         output_buffer.seek(0)
+
+        await record_usage_event(user["id"])
 
         output_name = f"{source_name}.pdf"
         content_disposition = build_download_header(output_name)
