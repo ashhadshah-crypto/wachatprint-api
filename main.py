@@ -1,6 +1,8 @@
 from io import BytesIO
 import html
+import os
 import re
+import zipfile
 from typing import List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -146,6 +148,62 @@ def chunk_items(items: List[Dict], chunk_size: int = 80) -> List[List[Dict]]:
         chunks.append(current)
 
     return chunks
+
+
+def decode_text_bytes(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return data.decode("latin-1", errors="ignore")
+
+
+def choose_txt_from_zip(zip_file: zipfile.ZipFile) -> str:
+    txt_files = [
+        name for name in zip_file.namelist()
+        if name.lower().endswith(".txt")
+        and not name.endswith("/")
+        and "__macosx" not in name.lower()
+    ]
+
+    if not txt_files:
+        raise HTTPException(status_code=400, detail="No .txt chat file found inside ZIP.")
+
+    def score(name: str):
+        lower = name.lower()
+        priority = 0
+        if "whatsapp" in lower:
+            priority -= 20
+        if "chat" in lower:
+            priority -= 10
+        if lower.endswith("_chat.txt"):
+            priority -= 10
+        return (priority, len(name), name)
+
+    txt_files.sort(key=score)
+    return txt_files[0]
+
+
+def extract_chat_text(filename: str, content: bytes):
+    lower_name = (filename or "").lower()
+
+    if lower_name.endswith(".txt"):
+        source_name = os.path.splitext(os.path.basename(filename))[0]
+        return source_name, decode_text_bytes(content)
+
+    if lower_name.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as zf:
+                chosen_txt = choose_txt_from_zip(zf)
+                txt_bytes = zf.read(chosen_txt)
+                source_name = os.path.splitext(os.path.basename(chosen_txt))[0]
+                return source_name, decode_text_bytes(txt_bytes)
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid ZIP file.")
+
+    raise HTTPException(status_code=400, detail="Only .txt and .zip files are supported.")
 
 
 def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_chunks: int) -> str:
@@ -396,30 +454,18 @@ async def convert_txt(file: UploadFile = File(...)):
     try:
         filename = file.filename or ""
 
-        if not filename.lower().endswith(".txt"):
-            raise HTTPException(status_code=400, detail="Only .txt files are allowed for now.")
-
         content = await file.read()
 
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File is too large. Max 5 MB allowed.")
 
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                text = content.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                text = content.decode("latin-1", errors="ignore")
-
+        source_name, text = extract_chat_text(filename, content)
         items = parse_whatsapp_text(text)
 
         if not items:
             raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
 
-        source_name = filename.rsplit(".", 1)[0]
         chunks = chunk_items(items, chunk_size=80)
-
         writer = PdfWriter()
 
         async with async_playwright() as p:
@@ -443,7 +489,7 @@ async def convert_txt(file: UploadFile = File(...)):
         writer.write(output_buffer)
         output_buffer.seek(0)
 
-        output_name = filename.rsplit(".", 1)[0] + ".pdf"
+        output_name = f"{source_name}.pdf"
 
         return StreamingResponse(
             output_buffer,
