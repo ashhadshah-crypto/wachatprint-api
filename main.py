@@ -382,15 +382,15 @@ async def convert_txt(file: UploadFile = File(...)):
         source_name = filename.rsplit(".", 1)[0]
         html_content = build_chat_html(source_name, items)
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
-            page = browser.new_page()
-            page.set_content(html_content, wait_until="load")
-            page.emulate_media(media="screen")
-            pdf_bytes = page.pdf(
+            page = await browser.new_page()
+            await page.set_content(html_content, wait_until="load")
+            await page.emulate_media(media="screen")
+            pdf_bytes = await page.pdf(
                 format="A4",
                 print_background=True,
                 margin={
@@ -401,7 +401,7 @@ async def convert_txt(file: UploadFile = File(...)):
                 },
                 prefer_css_page_size=True,
             )
-            browser.close()
+            await browser.close()
 
         output_name = filename.rsplit(".", 1)[0] + ".pdf"
 
