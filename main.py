@@ -1,11 +1,11 @@
 from io import BytesIO
 import html
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from playwright.sync_api import sync_playwright
 
 
@@ -60,7 +60,10 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
 
         if not line.strip():
             if messages:
-                messages[-1]["message"] += "\n"
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("type") == "message":
+                        messages[i]["message"] += "\n"
+                        break
             continue
 
         match = PATTERN_BRACKET.match(line) or PATTERN_DASH.match(line)
@@ -100,15 +103,13 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
                 }
             )
         else:
-            if messages:
-                # append to last real message
-                for i in range(len(messages) - 1, -1, -1):
-                    if messages[i].get("type") == "message":
-                        if messages[i]["message"]:
-                            messages[i]["message"] += "\n" + line
-                        else:
-                            messages[i]["message"] = line
-                        break
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("type") == "message":
+                    if messages[i]["message"]:
+                        messages[i]["message"] += "\n" + line
+                    else:
+                        messages[i]["message"] = line
+                    break
             else:
                 messages.append(
                     {
@@ -355,57 +356,66 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
 
 @app.post("/convert-txt")
 async def convert_txt(file: UploadFile = File(...)):
-    filename = file.filename or ""
-
-    if not filename.lower().endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt files are allowed for now.")
-
-    content = await file.read()
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File is too large. Max 5 MB allowed.")
-
     try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
+        filename = file.filename or ""
+
+        if not filename.lower().endswith(".txt"):
+            raise HTTPException(status_code=400, detail="Only .txt files are allowed for now.")
+
+        content = await file.read()
+
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File is too large. Max 5 MB allowed.")
+
         try:
-            text = content.decode("utf-8-sig")
+            text = content.decode("utf-8")
         except UnicodeDecodeError:
-            text = content.decode("latin-1", errors="ignore")
+            try:
+                text = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = content.decode("latin-1", errors="ignore")
 
-    items = parse_whatsapp_text(text)
+        items = parse_whatsapp_text(text)
 
-    if not items:
-        raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
+        if not items:
+            raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
 
-    source_name = filename.rsplit(".", 1)[0]
-    html_content = build_chat_html(source_name, items)
+        source_name = filename.rsplit(".", 1)[0]
+        html_content = build_chat_html(source_name, items)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            page = browser.new_page()
+            page.set_content(html_content, wait_until="load")
+            page.emulate_media(media="screen")
+            pdf_bytes = page.pdf(
+                format="A4",
+                print_background=True,
+                margin={
+                    "top": "10mm",
+                    "right": "8mm",
+                    "bottom": "12mm",
+                    "left": "8mm",
+                },
+                prefer_css_page_size=True,
+            )
+            browser.close()
+
+        output_name = filename.rsplit(".", 1)[0] + ".pdf"
+
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
         )
-        page = browser.new_page()
-        page.set_content(html_content, wait_until="load")
-        page.emulate_media(media="screen")
-        pdf_bytes = page.pdf(
-            format="A4",
-            print_background=True,
-            margin={
-                "top": "10mm",
-                "right": "8mm",
-                "bottom": "12mm",
-                "left": "8mm",
-            },
-            prefer_css_page_size=True,
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
         )
-        browser.close()
-
-    output_name = filename.rsplit(".", 1)[0] + ".pdf"
-
-    return StreamingResponse(
-        BytesIO(pdf_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
-    )
