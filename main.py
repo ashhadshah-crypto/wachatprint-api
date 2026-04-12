@@ -4,6 +4,7 @@ import os
 import re
 import zipfile
 from typing import List, Dict
+from urllib.parse import quote
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -132,6 +133,19 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
 def format_message_html(text: str) -> str:
     safe = html.escape(text)
     return safe.replace("\n", "<br>")
+
+
+def build_download_header(filename: str) -> str:
+    safe_ascii = "".join(
+        ch if (32 <= ord(ch) < 127 and ch not in ['"', "\\"]) else "_"
+        for ch in filename
+    ).strip()
+
+    if not safe_ascii:
+        safe_ascii = "download.pdf"
+
+    encoded_utf8 = quote(filename)
+    return f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded_utf8}"
 
 
 def chunk_items(items: List[Dict], chunk_size: int = 80) -> List[List[Dict]]:
@@ -453,7 +467,6 @@ async def render_chunk_pdf(browser, source_name: str, chunk: List[Dict], chunk_n
 async def convert_txt(file: UploadFile = File(...)):
     try:
         filename = file.filename or ""
-
         content = await file.read()
 
         if len(content) > MAX_FILE_SIZE:
@@ -490,11 +503,12 @@ async def convert_txt(file: UploadFile = File(...)):
         output_buffer.seek(0)
 
         output_name = f"{source_name}.pdf"
+        content_disposition = build_download_header(output_name)
 
         return StreamingResponse(
             output_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
+            headers={"Content-Disposition": content_disposition}
         )
 
     except HTTPException:
