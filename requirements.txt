@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 python-multipart
-playwright
+playwright==1.58.0
