@@ -7,6 +7,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from playwright.async_api import async_playwright
+from pypdf import PdfReader, PdfWriter
 
 
 app = FastAPI(title="WAChatPrint API")
@@ -131,7 +132,7 @@ def format_message_html(text: str) -> str:
     return safe.replace("\n", "<br>")
 
 
-def chunk_items(items: List[Dict], chunk_size: int = 180) -> List[List[Dict]]:
+def chunk_items(items: List[Dict], chunk_size: int = 80) -> List[List[Dict]]:
     chunks = []
     current = []
 
@@ -147,74 +148,55 @@ def chunk_items(items: List[Dict], chunk_size: int = 180) -> List[List[Dict]]:
     return chunks
 
 
-def build_chat_html(source_name: str, items: List[Dict]) -> str:
-    pages = []
-    item_chunks = chunk_items(items, chunk_size=180)
+def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_chunks: int) -> str:
+    chunks: List[str] = []
 
-    for chunk in item_chunks:
-        chunks: List[str] = []
-
-        for item in chunk:
-            if item["type"] == "date_separator":
-                chunks.append(
-                    f"""
-                    <div class="date-separator-wrap">
-                      <div class="date-separator">{html.escape(item["date"])}</div>
-                    </div>
-                    """
-                )
-                continue
-
-            msg = item
-
-            if msg["is_system"]:
-                chunks.append(
-                    f"""
-                    <div class="system-wrap">
-                      <div class="system-message">
-                        <div class="system-text">{format_message_html(msg["message"])}</div>
-                        <div class="system-time">{html.escape(msg["time"] or "")}</div>
-                      </div>
-                    </div>
-                    """
-                )
-                continue
-
-            side_class = "left" if msg["side"] == "left" else "right"
-            sender_html = (
-                f'<div class="sender">{html.escape(msg["sender"])}</div>'
-                if msg["sender"]
-                else ""
-            )
-
+    for item in items:
+        if item["type"] == "date_separator":
             chunks.append(
                 f"""
-                <div class="msg-row {side_class}">
-                  <div class="bubble {side_class}">
-                    {sender_html}
-                    <div class="message-text">{format_message_html(msg["message"])}</div>
-                    <div class="meta">{html.escape(msg["time"] or "")}</div>
+                <div class="date-separator-wrap">
+                  <div class="date-separator">{html.escape(item["date"])}</div>
+                </div>
+                """
+            )
+            continue
+
+        msg = item
+
+        if msg["is_system"]:
+            chunks.append(
+                f"""
+                <div class="system-wrap">
+                  <div class="system-message">
+                    <div class="system-text">{format_message_html(msg["message"])}</div>
+                    <div class="system-time">{html.escape(msg["time"] or "")}</div>
                   </div>
                 </div>
                 """
             )
+            continue
 
-        page_html = "\n".join(chunks)
-        pages.append(
+        side_class = "left" if msg["side"] == "left" else "right"
+        sender_html = (
+            f'<div class="sender">{html.escape(msg["sender"])}</div>'
+            if msg["sender"]
+            else ""
+        )
+
+        chunks.append(
             f"""
-            <section class="print-page">
-              <div class="chat-card">
-                <div class="chat-title">
-                  <div><strong>{html.escape(source_name)}</strong></div>
-                  <div>Exported WhatsApp chat → PDF</div>
-                </div>
-                {page_html}
+            <div class="msg-row {side_class}">
+              <div class="bubble {side_class}">
+                {sender_html}
+                <div class="message-text">{format_message_html(msg["message"])}</div>
+                <div class="meta">{html.escape(msg["time"] or "")}</div>
               </div>
-            </section>
+            </div>
             """
         )
 
-    pages_html = "\n".join(pages)
+    chat_body = "\n".join(chunks)
 
     return f"""
 <!DOCTYPE html>
@@ -250,17 +232,6 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
       font-size: 18px;
       border-radius: 10px;
       margin-bottom: 10px;
-    }}
-
-    .print-page {{
-      page-break-after: always;
-      break-after: page;
-      min-height: 260mm;
-    }}
-
-    .print-page:last-child {{
-      page-break-after: auto;
-      break-after: auto;
     }}
 
     .chat-card {{
@@ -383,10 +354,41 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
 </head>
 <body>
   <div class="topbar">WAChatPrint</div>
-  {pages_html}
+
+  <div class="chat-card">
+    <div class="chat-title">
+      <div><strong>{html.escape(source_name)}</strong></div>
+      <div>Part {chunk_no} of {total_chunks}</div>
+    </div>
+
+    {chat_body}
+  </div>
 </body>
 </html>
     """
+
+
+async def render_chunk_pdf(browser, source_name: str, chunk: List[Dict], chunk_no: int, total_chunks: int) -> bytes:
+    html_content = build_chat_html(source_name, chunk, chunk_no, total_chunks)
+    page = await browser.new_page()
+
+    try:
+        await page.set_content(html_content, wait_until="load")
+        await page.emulate_media(media="screen")
+        pdf_bytes = await page.pdf(
+            format="A4",
+            print_background=True,
+            margin={
+                "top": "10mm",
+                "right": "8mm",
+                "bottom": "12mm",
+                "left": "8mm",
+            },
+            prefer_css_page_size=True,
+        )
+        return pdf_bytes
+    finally:
+        await page.close()
 
 
 @app.post("/convert-txt")
@@ -416,33 +418,35 @@ async def convert_txt(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
 
         source_name = filename.rsplit(".", 1)[0]
-        html_content = build_chat_html(source_name, items)
+        chunks = chunk_items(items, chunk_size=80)
+
+        writer = PdfWriter()
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
-            page = await browser.new_page()
-            await page.set_content(html_content, wait_until="load")
-            await page.emulate_media(media="screen")
-            pdf_bytes = await page.pdf(
-                format="A4",
-                print_background=True,
-                margin={
-                    "top": "10mm",
-                    "right": "8mm",
-                    "bottom": "12mm",
-                    "left": "8mm",
-                },
-                prefer_css_page_size=True,
-            )
-            await browser.close()
+
+            try:
+                total_chunks = len(chunks)
+
+                for idx, chunk in enumerate(chunks, start=1):
+                    pdf_bytes = await render_chunk_pdf(browser, source_name, chunk, idx, total_chunks)
+                    reader = PdfReader(BytesIO(pdf_bytes))
+                    for page in reader.pages:
+                        writer.add_page(page)
+            finally:
+                await browser.close()
+
+        output_buffer = BytesIO()
+        writer.write(output_buffer)
+        output_buffer.seek(0)
 
         output_name = filename.rsplit(".", 1)[0] + ".pdf"
 
         return StreamingResponse(
-            BytesIO(pdf_bytes),
+            output_buffer,
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
         )
