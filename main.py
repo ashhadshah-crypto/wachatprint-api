@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from playwright.async_api import async_playwright
 
+
 app = FastAPI(title="WAChatPrint API")
 
 app.add_middleware(
@@ -130,55 +131,90 @@ def format_message_html(text: str) -> str:
     return safe.replace("\n", "<br>")
 
 
-def build_chat_html(source_name: str, items: List[Dict]) -> str:
-    chunks: List[str] = []
+def chunk_items(items: List[Dict], chunk_size: int = 180) -> List[List[Dict]]:
+    chunks = []
+    current = []
 
     for item in items:
-        if item["type"] == "date_separator":
-            chunks.append(
-                f"""
-                <div class="date-separator-wrap">
-                  <div class="date-separator">{html.escape(item["date"])}</div>
-                </div>
-                """
+        current.append(item)
+        if len(current) >= chunk_size:
+            chunks.append(current)
+            current = []
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def build_chat_html(source_name: str, items: List[Dict]) -> str:
+    pages = []
+    item_chunks = chunk_items(items, chunk_size=180)
+
+    for chunk in item_chunks:
+        chunks: List[str] = []
+
+        for item in chunk:
+            if item["type"] == "date_separator":
+                chunks.append(
+                    f"""
+                    <div class="date-separator-wrap">
+                      <div class="date-separator">{html.escape(item["date"])}</div>
+                    </div>
+                    """
+                )
+                continue
+
+            msg = item
+
+            if msg["is_system"]:
+                chunks.append(
+                    f"""
+                    <div class="system-wrap">
+                      <div class="system-message">
+                        <div class="system-text">{format_message_html(msg["message"])}</div>
+                        <div class="system-time">{html.escape(msg["time"] or "")}</div>
+                      </div>
+                    </div>
+                    """
+                )
+                continue
+
+            side_class = "left" if msg["side"] == "left" else "right"
+            sender_html = (
+                f'<div class="sender">{html.escape(msg["sender"])}</div>'
+                if msg["sender"]
+                else ""
             )
-            continue
 
-        msg = item
-
-        if msg["is_system"]:
             chunks.append(
                 f"""
-                <div class="system-wrap">
-                  <div class="system-message">
-                    <div class="system-text">{format_message_html(msg["message"])}</div>
-                    <div class="system-time">{html.escape(msg["time"] or "")}</div>
+                <div class="msg-row {side_class}">
+                  <div class="bubble {side_class}">
+                    {sender_html}
+                    <div class="message-text">{format_message_html(msg["message"])}</div>
+                    <div class="meta">{html.escape(msg["time"] or "")}</div>
                   </div>
                 </div>
                 """
             )
-            continue
 
-        side_class = "left" if msg["side"] == "left" else "right"
-        sender_html = (
-            f'<div class="sender">{html.escape(msg["sender"])}</div>'
-            if msg["sender"]
-            else ""
-        )
-
-        chunks.append(
+        page_html = "\n".join(chunks)
+        pages.append(
             f"""
-            <div class="msg-row {side_class}">
-              <div class="bubble {side_class}">
-                {sender_html}
-                <div class="message-text">{format_message_html(msg["message"])}</div>
-                <div class="meta">{html.escape(msg["time"] or "")}</div>
+            <section class="print-page">
+              <div class="chat-card">
+                <div class="chat-title">
+                  <div><strong>{html.escape(source_name)}</strong></div>
+                  <div>Exported WhatsApp chat → PDF</div>
+                </div>
+                {page_html}
               </div>
-            </div>
+            </section>
             """
         )
 
-    chat_body = "\n".join(chunks)
+    pages_html = "\n".join(pages)
 
     return f"""
 <!DOCTYPE html>
@@ -189,7 +225,7 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
   <style>
     @page {{
       size: A4;
-      margin: 12mm 10mm 14mm 10mm;
+      margin: 10mm 8mm 12mm 8mm;
     }}
 
     * {{
@@ -206,10 +242,6 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
       print-color-adjust: exact;
     }}
 
-    .page {{
-      width: 100%;
-    }}
-
     .topbar {{
       background: #0f8f7d;
       color: white;
@@ -217,11 +249,22 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
       font-weight: 700;
       font-size: 18px;
       border-radius: 10px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
+    }}
+
+    .print-page {{
+      page-break-after: always;
+      break-after: page;
+      min-height: 260mm;
+    }}
+
+    .print-page:last-child {{
+      page-break-after: auto;
+      break-after: auto;
     }}
 
     .chat-card {{
-      background: rgba(255,255,255,0.28);
+      background: #f6f1ea;
       border-radius: 14px;
       padding: 10px;
     }}
@@ -247,7 +290,7 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
     .date-separator-wrap,
     .system-wrap {{
       text-align: center;
-      margin: 12px 0;
+      margin: 10px 0;
     }}
 
     .date-separator {{
@@ -279,8 +322,10 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
 
     .msg-row {{
       display: flex;
-      margin: 8px 0;
+      margin: 7px 0;
       width: 100%;
+      break-inside: avoid;
+      page-break-inside: avoid;
     }}
 
     .msg-row.left {{
@@ -295,10 +340,11 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
       max-width: 72%;
       padding: 8px 10px 6px;
       border-radius: 12px;
-      box-shadow: 0 1px 1px rgba(0,0,0,0.08);
-      line-height: 1.5;
+      line-height: 1.45;
       word-break: break-word;
       white-space: normal;
+      break-inside: avoid;
+      page-break-inside: avoid;
     }}
 
     .bubble.left {{
@@ -336,18 +382,8 @@ def build_chat_html(source_name: str, items: List[Dict]) -> str:
   </style>
 </head>
 <body>
-  <div class="page">
-    <div class="topbar">WAChatPrint</div>
-
-    <div class="chat-card">
-      <div class="chat-title">
-        <div><strong>{html.escape(source_name)}</strong></div>
-        <div>Exported WhatsApp chat → PDF</div>
-      </div>
-
-      {chat_body}
-    </div>
-  </div>
+  <div class="topbar">WAChatPrint</div>
+  {pages_html}
 </body>
 </html>
     """
