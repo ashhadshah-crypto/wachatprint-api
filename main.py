@@ -1,4 +1,5 @@
 from io import BytesIO
+import asyncio
 import html
 import os
 import re
@@ -8,6 +9,7 @@ from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import stripe
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -33,6 +35,18 @@ ABSOLUTE_MAX_FILE_SIZE = 50 * 1024 * 1024  # hard system cap 50 MB
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID_PRO_MONTHLY = os.getenv("STRIPE_PRICE_ID_PRO_MONTHLY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://www.wachatprint.com")
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+FREE_PLAN_LIMIT_MB = 5
+FREE_PLAN_DAILY_LIMIT = 2
+PRO_PLAN_LIMIT_MB = 50
+PRO_PLAN_DAILY_LIMIT = 50
 
 PATTERN_BRACKET = re.compile(
     r"^\[(?P<date>[^,\]]+),\s*(?P<time>[^\]]+)\]\s*(?P<rest>.+)$"
@@ -492,55 +506,111 @@ async def get_authenticated_user(request: Request):
     return response.json()
 
 
-async def get_user_profile(user_id: str):
+async def supabase_get(table: str, params: dict):
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/user_profiles",
-            params={
-                "id": f"eq.{user_id}",
-                "select": "plan,max_file_size_mb,daily_conversion_limit",
-            },
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            params=params,
             headers={
                 "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
             },
         )
-
     if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Could not read plan profile.")
+        raise HTTPException(status_code=500, detail=f"Could not read {table}.")
+    return response.json()
 
-    rows = response.json()
+
+async def supabase_patch(table: str, filters: dict, payload: dict):
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            params=filters,
+            json=payload,
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+    if response.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=f"Could not update {table}.")
+
+
+async def supabase_insert(table: str, payload: dict):
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            json=payload,
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+    if response.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=500, detail=f"Could not insert into {table}.")
+
+
+async def get_user_profile(user_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "id": f"eq.{user_id}",
+            "select": "plan,max_file_size_mb,daily_conversion_limit,stripe_customer_id,stripe_subscription_id,subscription_status,current_period_end",
+        },
+    )
+
     if not rows:
         return {
             "plan": "free",
-            "max_file_size_mb": 5,
-            "daily_conversion_limit": 2,
+            "max_file_size_mb": FREE_PLAN_LIMIT_MB,
+            "daily_conversion_limit": FREE_PLAN_DAILY_LIMIT,
+            "stripe_customer_id": None,
+            "stripe_subscription_id": None,
+            "subscription_status": "inactive",
+            "current_period_end": None,
         }
 
     return rows[0]
 
 
+async def get_profile_by_customer_id(customer_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "stripe_customer_id": f"eq.{customer_id}",
+            "select": "id",
+        },
+    )
+    return rows[0] if rows else None
+
+
+async def get_profile_by_subscription_id(subscription_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "stripe_subscription_id": f"eq.{subscription_id}",
+            "select": "id",
+        },
+    )
+    return rows[0] if rows else None
+
+
 async def get_usage_count_last_24h(user_id: str) -> int:
     since = datetime.now(timezone.utc) - timedelta(days=1)
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/conversion_usage",
-            params={
-                "user_id": f"eq.{user_id}",
-                "created_at": f"gte.{since.isoformat()}",
-                "select": "id",
-            },
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            },
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Could not read usage history.")
-
-    return len(response.json())
+    rows = await supabase_get(
+        "conversion_usage",
+        {
+            "user_id": f"eq.{user_id}",
+            "created_at": f"gte.{since.isoformat()}",
+            "select": "id",
+        },
+    )
+    return len(rows)
 
 
 async def build_usage_summary(user_id: str):
@@ -556,24 +626,43 @@ async def build_usage_summary(user_id: str):
         "daily_conversion_limit": daily_limit,
         "used_last_24h": used_last_24h,
         "remaining_today": max(daily_limit - used_last_24h, 0),
+        "subscription_status": profile.get("subscription_status") or "inactive",
+        "current_period_end": profile.get("current_period_end"),
     }
 
 
 async def record_usage_event(user_id: str):
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            f"{SUPABASE_URL}/rest/v1/conversion_usage",
-            json={"user_id": user_id},
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            },
-        )
+    await supabase_insert("conversion_usage", {"user_id": user_id})
 
-    if response.status_code not in (200, 201, 204):
-        raise HTTPException(status_code=500, detail="Could not record usage.")
+
+def pro_profile_payload(subscription_status: str, stripe_customer_id: str | None, stripe_subscription_id: str | None, current_period_end: str | None):
+    return {
+        "plan": "pro",
+        "max_file_size_mb": PRO_PLAN_LIMIT_MB,
+        "daily_conversion_limit": PRO_PLAN_DAILY_LIMIT,
+        "stripe_customer_id": stripe_customer_id,
+        "stripe_subscription_id": stripe_subscription_id,
+        "subscription_status": subscription_status,
+        "current_period_end": current_period_end,
+    }
+
+
+def free_profile_payload(subscription_status: str, stripe_customer_id: str | None, current_period_end: str | None):
+    return {
+        "plan": "free",
+        "max_file_size_mb": FREE_PLAN_LIMIT_MB,
+        "daily_conversion_limit": FREE_PLAN_DAILY_LIMIT,
+        "stripe_customer_id": stripe_customer_id,
+        "stripe_subscription_id": None,
+        "subscription_status": subscription_status,
+        "current_period_end": current_period_end,
+    }
+
+
+def to_iso_from_unix(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 @app.get("/usage-summary")
@@ -587,10 +676,174 @@ async def usage_summary(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(request: Request):
+    try:
+        if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID_PRO_MONTHLY:
+            raise HTTPException(status_code=500, detail="Stripe config is missing.")
+
+        user = await get_authenticated_user(request)
+        profile = await get_user_profile(user["id"])
+
+        if profile.get("subscription_status") in ("active", "trialing", "past_due"):
+            raise HTTPException(status_code=400, detail="You already have an active paid plan. Use Manage Billing.")
+
+        params = {
+            "mode": "subscription",
+            "success_url": f"{APP_BASE_URL}/billing-success.html?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{APP_BASE_URL}/billing-cancel.html",
+            "line_items": [
+                {
+                    "price": STRIPE_PRICE_ID_PRO_MONTHLY,
+                    "quantity": 1,
+                }
+            ],
+            "client_reference_id": user["id"],
+            "metadata": {
+                "user_id": user["id"],
+                "email": user.get("email", ""),
+                "product": "WAChatPrint Pro",
+            },
+            "subscription_data": {
+                "metadata": {
+                    "user_id": user["id"],
+                }
+            },
+            "allow_promotion_codes": True,
+        }
+
+        if profile.get("stripe_customer_id"):
+            params["customer"] = profile["stripe_customer_id"]
+        else:
+            params["customer_email"] = user.get("email", "")
+
+        session = await asyncio.to_thread(stripe.checkout.Session.create, **params)
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/create-portal-session")
+async def create_portal_session(request: Request):
+    try:
+        if not STRIPE_SECRET_KEY:
+            raise HTTPException(status_code=500, detail="Stripe config is missing.")
+
+        user = await get_authenticated_user(request)
+        profile = await get_user_profile(user["id"])
+
+        if not profile.get("stripe_customer_id"):
+            raise HTTPException(status_code=400, detail="No billing profile found yet. Upgrade first.")
+
+        session = await asyncio.to_thread(
+            stripe.billing_portal.Session.create,
+            customer=profile["stripe_customer_id"],
+            return_url=f"{APP_BASE_URL}/dashboard.html",
         )
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    try:
+        if not STRIPE_WEBHOOK_SECRET:
+            raise HTTPException(status_code=500, detail="Stripe webhook secret is missing.")
+
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature")
+
+        event = await asyncio.to_thread(
+            stripe.Webhook.construct_event,
+            payload,
+            sig_header,
+            STRIPE_WEBHOOK_SECRET,
+        )
+
+        event_type = event["type"]
+        obj = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            if obj.get("mode") == "subscription":
+                user_id = obj.get("client_reference_id") or obj.get("metadata", {}).get("user_id")
+                if user_id:
+                    await supabase_patch(
+                        "user_profiles",
+                        {"id": f"eq.{user_id}"},
+                        pro_profile_payload(
+                            subscription_status="active",
+                            stripe_customer_id=obj.get("customer"),
+                            stripe_subscription_id=obj.get("subscription"),
+                            current_period_end=None,
+                        ),
+                    )
+
+        elif event_type == "customer.subscription.updated":
+            sub_id = obj.get("id")
+            customer_id = obj.get("customer")
+            status = obj.get("status")
+            period_end = to_iso_from_unix(obj.get("current_period_end"))
+
+            profile = await get_profile_by_subscription_id(sub_id)
+            if not profile and customer_id:
+                profile = await get_profile_by_customer_id(customer_id)
+
+            if profile:
+                if status in ("active", "trialing", "past_due"):
+                    await supabase_patch(
+                        "user_profiles",
+                        {"id": f"eq.{profile['id']}"},
+                        pro_profile_payload(
+                            subscription_status=status,
+                            stripe_customer_id=customer_id,
+                            stripe_subscription_id=sub_id,
+                            current_period_end=period_end,
+                        ),
+                    )
+                else:
+                    await supabase_patch(
+                        "user_profiles",
+                        {"id": f"eq.{profile['id']}"},
+                        free_profile_payload(
+                            subscription_status=status or "inactive",
+                            stripe_customer_id=customer_id,
+                            current_period_end=period_end,
+                        ),
+                    )
+
+        elif event_type == "customer.subscription.deleted":
+            sub_id = obj.get("id")
+            customer_id = obj.get("customer")
+            period_end = to_iso_from_unix(obj.get("current_period_end"))
+
+            profile = await get_profile_by_subscription_id(sub_id)
+            if not profile and customer_id:
+                profile = await get_profile_by_customer_id(customer_id)
+
+            if profile:
+                await supabase_patch(
+                    "user_profiles",
+                    {"id": f"eq.{profile['id']}"},
+                    free_profile_payload(
+                        subscription_status="canceled",
+                        stripe_customer_id=customer_id,
+                        current_period_end=period_end,
+                    ),
+                )
+
+        return {"received": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 @app.post("/convert-txt")
@@ -669,7 +922,4 @@ async def convert_txt(request: Request, file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
