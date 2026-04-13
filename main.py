@@ -543,6 +543,22 @@ async def get_usage_count_last_24h(user_id: str) -> int:
     return len(response.json())
 
 
+async def build_usage_summary(user_id: str):
+    profile = await get_user_profile(user_id)
+    used_last_24h = await get_usage_count_last_24h(user_id)
+
+    daily_limit = int(profile["daily_conversion_limit"])
+    used_last_24h = int(used_last_24h)
+
+    return {
+        "plan": profile["plan"],
+        "max_file_size_mb": int(profile["max_file_size_mb"]),
+        "daily_conversion_limit": daily_limit,
+        "used_last_24h": used_last_24h,
+        "remaining_today": max(daily_limit - used_last_24h, 0),
+    }
+
+
 async def record_usage_event(user_id: str):
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
@@ -560,6 +576,23 @@ async def record_usage_event(user_id: str):
         raise HTTPException(status_code=500, detail="Could not record usage.")
 
 
+@app.get("/usage-summary")
+async def usage_summary(request: Request):
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_ROLE_KEY:
+            raise HTTPException(status_code=500, detail="Backend pricing config is missing.")
+
+        user = await get_authenticated_user(request)
+        return await build_usage_summary(user["id"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
 @app.post("/convert-txt")
 async def convert_txt(request: Request, file: UploadFile = File(...)):
     try:
@@ -573,17 +606,17 @@ async def convert_txt(request: Request, file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Current system max is 50 MB.")
 
         user = await get_authenticated_user(request)
-        profile = await get_user_profile(user["id"])
-        used_today = await get_usage_count_last_24h(user["id"])
+        usage = await build_usage_summary(user["id"])
 
-        max_bytes = int(profile["max_file_size_mb"]) * 1024 * 1024
-        daily_limit = int(profile["daily_conversion_limit"])
-        plan_name = profile["plan"]
+        max_bytes = int(usage["max_file_size_mb"]) * 1024 * 1024
+        daily_limit = int(usage["daily_conversion_limit"])
+        plan_name = usage["plan"]
+        used_today = int(usage["used_last_24h"])
 
         if len(content) > max_bytes:
             raise HTTPException(
                 status_code=400,
-                detail=f"{plan_name.capitalize()} plan limit is {profile['max_file_size_mb']} MB."
+                detail=f"{plan_name.capitalize()} plan limit is {usage['max_file_size_mb']} MB."
             )
 
         if used_today >= daily_limit:
