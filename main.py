@@ -1,5 +1,6 @@
 from io import BytesIO
 import asyncio
+import base64
 import html
 import os
 import re
@@ -56,6 +57,27 @@ PATTERN_DASH = re.compile(
     r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}),\s*(?P<time>[^-]+?)\s*-\s*(?P<rest>.+)$"
 )
 
+ATTACHED_TAG_RE = re.compile(
+    r"^<attached:\s*(?P<name>[^>]+)>\s*(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+FILE_ATTACHED_RE = re.compile(
+    r"^(?P<name>.+?)\s*\((?:file|image|video|audio|document)\s+attached\)\s*(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_INLINE_IMAGES = 40
+
 
 @app.get("/")
 def root():
@@ -72,82 +94,6 @@ def split_sender_and_message(rest: str):
         sender, message = rest.split(": ", 1)
         return sender.strip(), message.strip(), False
     return None, rest.strip(), True
-
-
-def parse_whatsapp_text(text: str) -> List[Dict]:
-    messages: List[Dict] = []
-    sender_side_map: Dict[str, str] = {}
-    last_date = None
-
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-
-        if not line.strip():
-            if messages:
-                for i in range(len(messages) - 1, -1, -1):
-                    if messages[i].get("type") == "message":
-                        messages[i]["message"] += "\n"
-                        break
-            continue
-
-        match = PATTERN_BRACKET.match(line) or PATTERN_DASH.match(line)
-
-        if match:
-            date = match.group("date").strip()
-            time = match.group("time").strip()
-            rest = match.group("rest").strip()
-
-            sender, message, is_system = split_sender_and_message(rest)
-
-            if sender:
-                if sender not in sender_side_map:
-                    sender_side_map[sender] = "left" if len(sender_side_map) % 2 == 0 else "right"
-                side = sender_side_map[sender]
-            else:
-                side = "center"
-
-            if date != last_date:
-                messages.append(
-                    {
-                        "type": "date_separator",
-                        "date": date,
-                    }
-                )
-                last_date = date
-
-            messages.append(
-                {
-                    "type": "message",
-                    "date": date,
-                    "time": time,
-                    "sender": sender,
-                    "message": message,
-                    "is_system": is_system,
-                    "side": side,
-                }
-            )
-        else:
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("type") == "message":
-                    if messages[i]["message"]:
-                        messages[i]["message"] += "\n" + line
-                    else:
-                        messages[i]["message"] = line
-                    break
-            else:
-                messages.append(
-                    {
-                        "type": "message",
-                        "date": "",
-                        "time": "",
-                        "sender": None,
-                        "message": line,
-                        "is_system": True,
-                        "side": "center",
-                    }
-                )
-
-    return messages
 
 
 def format_message_html(text: str) -> str:
@@ -220,12 +166,219 @@ def choose_txt_from_zip(zip_file: zipfile.ZipFile) -> str:
     return txt_files[0]
 
 
-def extract_chat_text(filename: str, content: bytes):
+def format_attachment_size(size_bytes):
+    if size_bytes is None:
+        return ""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+def build_media_index_from_zip(zip_file: zipfile.ZipFile) -> Dict[str, Dict]:
+    media_index: Dict[str, Dict] = {}
+    inline_images_used = 0
+
+    for name in zip_file.namelist():
+        if name.endswith("/"):
+            continue
+
+        lower_name = name.lower()
+        if "__macosx" in lower_name:
+            continue
+
+        base_name = os.path.basename(name)
+        if not base_name:
+            continue
+
+        ext = os.path.splitext(base_name)[1].lower()
+        info = zip_file.getinfo(name)
+
+        entry = {
+            "filename": base_name,
+            "size_bytes": info.file_size,
+            "kind": "file",
+            "data_url": None,
+        }
+
+        if ext in IMAGE_MIME_TYPES:
+            entry["kind"] = "image"
+            if info.file_size <= MAX_INLINE_IMAGE_BYTES and inline_images_used < MAX_INLINE_IMAGES:
+                raw = zip_file.read(name)
+                encoded = base64.b64encode(raw).decode("ascii")
+                entry["data_url"] = f"data:{IMAGE_MIME_TYPES[ext]};base64,{encoded}"
+                inline_images_used += 1
+
+        media_index[base_name.lower()] = entry
+
+    return media_index
+
+
+def extract_attachment_reference(message: str):
+    text = (message or "").strip()
+
+    match = ATTACHED_TAG_RE.match(text)
+    if match:
+        return match.group("name").strip(), match.group("rest").strip()
+
+    match = FILE_ATTACHED_RE.match(text)
+    if match:
+        return match.group("name").strip(), match.group("rest").strip()
+
+    return None, message
+
+
+def annotate_message_attachment(message: str, media_index: Dict[str, Dict]):
+    filename, cleaned_message = extract_attachment_reference(message)
+
+    if not filename:
+        return message, None
+
+    key = filename.lower()
+    media = media_index.get(key)
+
+    ext = os.path.splitext(filename)[1].lower()
+    fallback_kind = "image" if ext in IMAGE_MIME_TYPES else "file"
+
+    if media:
+        return cleaned_message, {
+            "kind": media["kind"],
+            "filename": media["filename"],
+            "size_bytes": media["size_bytes"],
+            "data_url": media.get("data_url"),
+        }
+
+    return cleaned_message, {
+        "kind": fallback_kind,
+        "filename": filename,
+        "size_bytes": None,
+        "data_url": None,
+    }
+
+
+def parse_whatsapp_text(text: str, media_index: Dict[str, Dict] | None = None) -> List[Dict]:
+    messages: List[Dict] = []
+    sender_side_map: Dict[str, str] = {}
+    last_date = None
+    media_index = media_index or {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+
+        if not line.strip():
+            if messages:
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("type") == "message":
+                        messages[i]["message"] += "\n"
+                        break
+            continue
+
+        match = PATTERN_BRACKET.match(line) or PATTERN_DASH.match(line)
+
+        if match:
+            date = match.group("date").strip()
+            time = match.group("time").strip()
+            rest = match.group("rest").strip()
+
+            sender, message, is_system = split_sender_and_message(rest)
+            attachment = None
+
+            if not is_system:
+                message, attachment = annotate_message_attachment(message, media_index)
+
+            if sender:
+                if sender not in sender_side_map:
+                    sender_side_map[sender] = "left" if len(sender_side_map) % 2 == 0 else "right"
+                side = sender_side_map[sender]
+            else:
+                side = "center"
+
+            if date != last_date:
+                messages.append(
+                    {
+                        "type": "date_separator",
+                        "date": date,
+                    }
+                )
+                last_date = date
+
+            messages.append(
+                {
+                    "type": "message",
+                    "date": date,
+                    "time": time,
+                    "sender": sender,
+                    "message": message,
+                    "is_system": is_system,
+                    "side": side,
+                    "attachment": attachment,
+                }
+            )
+        else:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("type") == "message":
+                    if messages[i]["message"]:
+                        messages[i]["message"] += "\n" + line
+                    else:
+                        messages[i]["message"] = line
+                    break
+            else:
+                messages.append(
+                    {
+                        "type": "message",
+                        "date": "",
+                        "time": "",
+                        "sender": None,
+                        "message": line,
+                        "is_system": True,
+                        "side": "center",
+                        "attachment": None,
+                    }
+                )
+
+    return messages
+
+
+def build_attachment_html(attachment: Dict | None) -> str:
+    if not attachment:
+        return ""
+
+    filename = html.escape(attachment.get("filename", "attachment"))
+    size_label = format_attachment_size(attachment.get("size_bytes"))
+    size_html = f" · {html.escape(size_label)}" if size_label else ""
+
+    if attachment.get("kind") == "image" and attachment.get("data_url"):
+        data_url = html.escape(attachment["data_url"], quote=True)
+        return f"""
+        <div class="media-block">
+          <img class="chat-image" src="{data_url}" alt="{filename}" />
+          <div class="attachment-label">Image attached: {filename}{size_html}</div>
+        </div>
+        """
+
+    if attachment.get("kind") == "image":
+        return f"""
+        <div class="attachment-box">
+          <div class="attachment-title">Image attached</div>
+          <div class="attachment-sub">{filename}{size_html}</div>
+        </div>
+        """
+
+    return f"""
+    <div class="attachment-box">
+      <div class="attachment-title">Attachment</div>
+      <div class="attachment-sub">{filename}{size_html}</div>
+    </div>
+    """
+
+
+def extract_chat_payload(filename: str, content: bytes):
     lower_name = (filename or "").lower()
 
     if lower_name.endswith(".txt"):
         source_name = os.path.splitext(os.path.basename(filename))[0]
-        return source_name, decode_text_bytes(content)
+        return source_name, decode_text_bytes(content), {}
 
     if lower_name.endswith(".zip"):
         try:
@@ -233,7 +386,8 @@ def extract_chat_text(filename: str, content: bytes):
                 chosen_txt = choose_txt_from_zip(zf)
                 txt_bytes = zf.read(chosen_txt)
                 source_name = os.path.splitext(os.path.basename(chosen_txt))[0]
-                return source_name, decode_text_bytes(txt_bytes)
+                media_index = build_media_index_from_zip(zf)
+                return source_name, decode_text_bytes(txt_bytes), media_index
         except zipfile.BadZipFile:
             raise HTTPException(status_code=400, detail="Invalid ZIP file.")
 
@@ -276,12 +430,18 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
             else ""
         )
 
+        attachment_html = build_attachment_html(msg.get("attachment"))
+        message_text_html = ""
+        if (msg.get("message") or "").strip():
+            message_text_html = f'<div class="message-text">{format_message_html(msg["message"])}</div>'
+
         chunks.append(
             f"""
             <div class="msg-row {side_class}">
               <div class="bubble {side_class}">
                 {sender_html}
-                <div class="message-text">{format_message_html(msg["message"])}</div>
+                {attachment_html}
+                {message_text_html}
                 <div class="meta">{html.escape(msg["time"] or "")}</div>
               </div>
             </div>
@@ -429,6 +589,46 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
 
     .bubble.right .sender {{
       color: #0f8f7d;
+    }}
+
+    .media-block {{
+      margin-bottom: 6px;
+    }}
+
+    .chat-image {{
+      display: block;
+      max-width: 220px;
+      max-height: 220px;
+      width: auto;
+      height: auto;
+      border-radius: 10px;
+      border: 1px solid rgba(15, 23, 42, 0.08);
+      background: #f8fafc;
+    }}
+
+    .attachment-label {{
+      margin-top: 6px;
+      font-size: 11px;
+      color: #475569;
+    }}
+
+    .attachment-box {{
+      margin-bottom: 6px;
+      padding: 10px;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.05);
+    }}
+
+    .attachment-title {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #0f172a;
+    }}
+
+    .attachment-sub {{
+      font-size: 11px;
+      color: #475569;
+      margin-top: 2px;
     }}
 
     .message-text {{
@@ -878,8 +1078,8 @@ async def convert_txt(request: Request, file: UploadFile = File(...)):
                 detail=f"{plan_name.capitalize()} plan limit reached: {daily_limit} conversions per 24 hours."
             )
 
-        source_name, text = extract_chat_text(filename, content)
-        items = parse_whatsapp_text(text)
+        source_name, text, media_index = extract_chat_payload(filename, content)
+        items = parse_whatsapp_text(text, media_index)
 
         if not items:
             raise HTTPException(status_code=400, detail="Could not parse any messages from this file.")
