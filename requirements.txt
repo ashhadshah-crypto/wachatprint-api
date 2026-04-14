@@ -1,8 +1,8 @@
-fastapi
-uvicorn[standard]
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
 python-multipart
 playwright==1.58.0
 pypdf
 httpx==0.24.1
-stripe
-supabase==2.3.0
+stripe==8.10.0
+supabase==2.3.4
