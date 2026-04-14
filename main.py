@@ -1,60 +1,132 @@
-# main_fixed.py
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import stripe
+import os
+import httpx
+import asyncio
+from datetime import datetime, timezone
 
-# Replace only the relevant parts in your existing main.py
+app = FastAPI()
 
-# ---- FIXED VERIFY CHECKOUT SESSION ----
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ENV
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID_PRO_MONTHLY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+# -----------------------------
+# SUPABASE HELPERS (REST)
+# -----------------------------
+async def supabase_patch(table, filters, payload):
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            params=filters,
+            json=payload,
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+
+async def get_user(request: Request):
+    token = request.headers.get("authorization", "").replace("Bearer ", "")
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": os.getenv("SUPABASE_ANON_KEY"),
+                "Authorization": f"Bearer {token}",
+            },
+        )
+
+    if res.status_code != 200:
+        raise HTTPException(401, "Unauthorized")
+
+    return res.json()
+
+def to_iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+# -----------------------------
+# CHECKOUT SESSION
+# -----------------------------
+@app.post("/create-checkout-session")
+async def create_checkout_session(request: Request):
+    user = await get_user(request)
+
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        mode="subscription",
+        customer_email=user.get("email"),
+        line_items=[{
+            "price": STRIPE_PRICE_ID,
+            "quantity": 1
+        }],
+        success_url="https://www.wachatprint.com/billing-success.html?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://www.wachatprint.com/billing-cancel.html",
+        client_reference_id=user["id"],
+    )
+
+    return {"url": session.url}
+
+# -----------------------------
+# VERIFY CHECKOUT (FIX)
+# -----------------------------
 @app.post("/verify-checkout-session")
 async def verify_checkout_session(request: Request):
     try:
-        user = await get_authenticated_user(request)
+        user = await get_user(request)
         body = await request.json()
         session_id = body.get("session_id")
 
         if not session_id:
-            raise HTTPException(status_code=400, detail="Missing session_id.")
+            raise HTTPException(400, "Missing session_id")
 
-        session = await asyncio.to_thread(
-            stripe.checkout.Session.retrieve,
-            session_id,
-        )
+        session = stripe.checkout.Session.retrieve(session_id)
 
-        session_user_id = getattr(session, "client_reference_id", None)
-        if not session_user_id:
-            metadata = getattr(session, "metadata", {}) or {}
-            session_user_id = metadata.get("user_id")
+        user_id = getattr(session, "client_reference_id", None)
 
-        if session_user_id != user["id"]:
-            raise HTTPException(status_code=403, detail="Session mismatch")
+        if user_id != user["id"]:
+            raise HTTPException(403, "User mismatch")
 
         payment_status = getattr(session, "payment_status", None)
         customer_id = getattr(session, "customer", None)
         subscription_id = getattr(session, "subscription", None)
 
         if payment_status != "paid":
-            return {"success": False, "message": "Not paid yet"}
+            return {"success": False}
 
-        subscription_status = "active"
-        current_period_end = None
-
-        if subscription_id:
-            subscription = await asyncio.to_thread(
-                stripe.Subscription.retrieve,
-                subscription_id
-            )
-            subscription_status = getattr(subscription, "status", "active")
-            current_period_end = to_iso_from_unix(
-                getattr(subscription, "current_period_end", None)
-            )
+        sub = stripe.Subscription.retrieve(subscription_id)
 
         await supabase_patch(
             "user_profiles",
-            {"id": f"eq.{user['id']}"},
-            pro_profile_payload(
-                subscription_status,
-                customer_id,
-                subscription_id,
-                current_period_end,
-            ),
+            {"id": f"eq.{user_id}"},
+            {
+                "plan": "pro",
+                "subscription_status": getattr(sub, "status", "active"),
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": subscription_id,
+                "current_period_end": to_iso(getattr(sub, "current_period_end", None)),
+            },
         )
 
         return {"success": True}
@@ -62,18 +134,16 @@ async def verify_checkout_session(request: Request):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-
-# ---- FIXED STRIPE WEBHOOK ----
+# -----------------------------
+# WEBHOOK (BACKUP)
+# -----------------------------
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
+    sig = request.headers.get("stripe-signature")
 
-    event = await asyncio.to_thread(
-        stripe.Webhook.construct_event,
-        payload,
-        sig_header,
-        STRIPE_WEBHOOK_SECRET,
+    event = stripe.Webhook.construct_event(
+        payload, sig, STRIPE_WEBHOOK_SECRET
     )
 
     obj = event["data"]["object"]
@@ -93,4 +163,31 @@ async def stripe_webhook(request: Request):
                 },
             )
 
-    return {"received": True}
+    return {"ok": True}
+
+# -----------------------------
+# USAGE SUMMARY (FOR DASHBOARD)
+# -----------------------------
+@app.get("/usage-summary")
+async def usage_summary(request: Request):
+    user = await get_user(request)
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={
+                "id": f"eq.{user['id']}",
+                "select": "*"
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+        )
+
+    data = res.json()
+
+    if not data:
+        return {"plan": "free"}
+
+    return data[0]
