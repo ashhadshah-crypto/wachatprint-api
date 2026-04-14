@@ -3,6 +3,6 @@ uvicorn[standard]
 python-multipart
 playwright==1.58.0
 pypdf
-httpx
+httpx==0.24.1
 stripe
-supabase==2.4.0
+supabase==2.3.0
