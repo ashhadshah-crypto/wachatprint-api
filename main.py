@@ -1,4 +1,5 @@
 from io import BytesIO
+import asyncio
 import base64
 import html
 import mimetypes
@@ -10,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
+import stripe
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -36,6 +38,18 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID_PRO_MONTHLY = os.getenv("STRIPE_PRICE_ID_PRO_MONTHLY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://www.wachatprint.com")
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+FREE_PLAN_LIMIT_MB = 5
+FREE_PLAN_DAILY_LIMIT = 2
+PRO_PLAN_LIMIT_MB = 50
+PRO_PLAN_DAILY_LIMIT = 50
+
 PATTERN_BRACKET = re.compile(
     r"^\[(?P<date>[^,\]]+),\s*(?P<time>[^\]]+)\]\s*(?P<rest>.+)$"
 )
@@ -45,7 +59,7 @@ PATTERN_DASH = re.compile(
 )
 
 ATTACHED_NAME_PATTERN = re.compile(
-    r"^(?:<attached:\s*)?(?P<name>[^>\n]+?\.[A-Za-z0-9]{2,6})(?:>)?"
+    r"^(?:<attached:\s*)?(?P<name>[^>\n]+?\.[A-Za-z0-9]{2,8})(?:>)?"
     r"(?:\s*\((?:file|image|video|audio|document|media|sticker)\s+attached\))?"
     r"(?:\s*[·•]\s*(?P<size>[\d.]+\s*(?:KB|MB|GB)))?$",
     re.IGNORECASE,
@@ -74,7 +88,6 @@ DOCUMENT_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".txt", ".csv", ".zip", ".rar"
 }
-
 EXPORT_FORMATS = {"pdf", "pdf_media_zip", "html_zip"}
 
 
@@ -107,6 +120,83 @@ def format_bytes(value: int) -> str:
     if value < 1024 * 1024 * 1024:
         return f"{value / (1024 * 1024):.1f} MB"
     return f"{value / (1024 * 1024 * 1024):.1f} GB"
+
+
+def format_message_html(text: str) -> str:
+    safe = html.escape(text or "")
+    return safe.replace("\n", "<br>")
+
+
+def build_download_header(filename: str) -> str:
+    safe_ascii = "".join(
+        ch if (32 <= ord(ch) < 127 and ch not in ['"', "\\"]) else "_"
+        for ch in filename
+    ).strip()
+
+    if not safe_ascii:
+        safe_ascii = "download"
+
+    encoded_utf8 = quote(filename)
+    return f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{encoded_utf8}'
+
+
+def chunk_items(items: List[Dict], chunk_size: int = 60) -> List[List[Dict]]:
+    chunks: List[List[Dict]] = []
+    current: List[Dict] = []
+
+    for item in items:
+        current.append(item)
+        if len(current) >= chunk_size:
+            if current and current[-1].get("type") == "date_separator":
+                current.pop()
+
+            if current:
+                chunks.append(current)
+                current = []
+
+            if item.get("type") == "date_separator":
+                current.append(item)
+
+    if current:
+        chunks.append(current)
+
+    return chunks or [[]]
+
+
+def decode_text_bytes(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return data.decode("latin-1", errors="ignore")
+
+
+def choose_txt_from_zip(zip_file: zipfile.ZipFile) -> str:
+    txt_files = [
+        name for name in zip_file.namelist()
+        if name.lower().endswith(".txt")
+        and not name.endswith("/")
+        and "__macosx" not in name.lower()
+    ]
+
+    if not txt_files:
+        raise HTTPException(status_code=400, detail="No .txt chat file found inside ZIP.")
+
+    def score(name: str):
+        lower = name.lower()
+        priority = 0
+        if "whatsapp" in lower:
+            priority -= 20
+        if "chat" in lower:
+            priority -= 10
+        if lower.endswith("_chat.txt"):
+            priority -= 10
+        return (priority, len(name), name)
+
+    txt_files.sort(key=score)
+    return txt_files[0]
 
 
 def guess_media_kind(filename: str, label: Optional[str] = None) -> str:
@@ -270,104 +360,6 @@ def parse_whatsapp_text(text: str) -> List[Dict]:
     return messages
 
 
-def format_message_html(text: str) -> str:
-    safe = html.escape(text or "")
-    return safe.replace("\n", "<br>")
-
-
-def build_download_header(filename: str) -> str:
-    safe_ascii = "".join(
-        ch if (32 <= ord(ch) < 127 and ch not in ['"', "\\"]) else "_"
-        for ch in filename
-    ).strip()
-
-    if not safe_ascii:
-        safe_ascii = "download"
-
-    encoded_utf8 = quote(filename)
-    return f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{encoded_utf8}'
-
-
-def chunk_items(items: List[Dict], chunk_size: int = 60) -> List[List[Dict]]:
-    chunks: List[List[Dict]] = []
-    current: List[Dict] = []
-
-    for item in items:
-        current.append(item)
-        if len(current) >= chunk_size:
-            if current and current[-1].get("type") == "date_separator":
-                current.pop()
-
-            if current:
-                chunks.append(current)
-                current = []
-
-            if item.get("type") == "date_separator":
-                current.append(item)
-
-    if current:
-        chunks.append(current)
-
-    return chunks or [[]]
-
-
-def decode_text_bytes(data: bytes) -> str:
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            return data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            return data.decode("latin-1", errors="ignore")
-
-
-def choose_txt_from_zip(zip_file: zipfile.ZipFile) -> str:
-    txt_files = [
-        name for name in zip_file.namelist()
-        if name.lower().endswith(".txt")
-        and not name.endswith("/")
-        and "__macosx" not in name.lower()
-    ]
-
-    if not txt_files:
-        raise HTTPException(status_code=400, detail="No .txt chat file found inside ZIP.")
-
-    def score(name: str):
-        lower = name.lower()
-        priority = 0
-        if "whatsapp" in lower:
-            priority -= 20
-        if "chat" in lower:
-            priority -= 10
-        if lower.endswith("_chat.txt"):
-            priority -= 10
-        return (priority, len(name), name)
-
-    txt_files.sort(key=score)
-    return txt_files[0]
-
-
-def extract_chat_bundle(filename: str, content: bytes) -> Tuple[str, str, Dict[str, Dict]]:
-    lower_name = (filename or "").lower()
-
-    if lower_name.endswith(".txt"):
-        source_name = os.path.splitext(os.path.basename(filename))[0]
-        return source_name, decode_text_bytes(content), {}
-
-    if lower_name.endswith(".zip"):
-        try:
-            with zipfile.ZipFile(BytesIO(content)) as zf:
-                chosen_txt = choose_txt_from_zip(zf)
-                txt_bytes = zf.read(chosen_txt)
-                source_name = os.path.splitext(os.path.basename(chosen_txt))[0]
-                media_index = build_media_index(zf, chosen_txt)
-                return source_name, decode_text_bytes(txt_bytes), media_index
-        except zipfile.BadZipFile:
-            raise HTTPException(status_code=400, detail="Invalid ZIP file.")
-
-    raise HTTPException(status_code=400, detail="Only .txt and .zip files are supported.")
-
-
 def parse_filename_line(line: str, forced_label: Optional[str] = None) -> Optional[Dict]:
     cleaned = clean_line(line)
     if not cleaned:
@@ -485,6 +477,27 @@ def data_uri_from_asset(asset: Dict) -> str:
     return f"data:{asset['content_type']};base64,{encoded}"
 
 
+def extract_chat_bundle(filename: str, content: bytes) -> Tuple[str, str, Dict[str, Dict]]:
+    lower_name = (filename or "").lower()
+
+    if lower_name.endswith(".txt"):
+        source_name = os.path.splitext(os.path.basename(filename))[0]
+        return source_name, decode_text_bytes(content), {}
+
+    if lower_name.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as zf:
+                chosen_txt = choose_txt_from_zip(zf)
+                txt_bytes = zf.read(chosen_txt)
+                source_name = os.path.splitext(os.path.basename(chosen_txt))[0]
+                media_index = build_media_index(zf, chosen_txt)
+                return source_name, decode_text_bytes(txt_bytes), media_index
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid ZIP file.")
+
+    raise HTTPException(status_code=400, detail="Only .txt and .zip files are supported.")
+
+
 def build_export_label(render_mode: str) -> str:
     if render_mode == "html":
         return "Interactive HTML Export"
@@ -507,21 +520,14 @@ def render_media_block(msg: Dict, render_mode: str) -> str:
     if kind == "image":
         if asset:
             image_src = asset["relative_path"] if render_mode == "html" else data_uri_from_asset(asset)
-            image_html = (
-                f'<img src="{image_src}" alt="{html.escape(filename)}" class="chat-image" />'
-            )
+            image_html = f'<img src="{image_src}" alt="{html.escape(filename)}" class="chat-image" />'
         else:
             image_html = '<div class="missing-media">Image not found</div>'
 
-        details = ""
-        if meta_line:
-            details = f'<div class="attachment-meta">{meta_line}</div>'
-
+        details = f'<div class="attachment-meta">{meta_line}</div>' if meta_line else ""
         return f"""
         <div class="media-block">
-          <div class="image-wrap">
-            {image_html}
-          </div>
+          <div class="image-wrap">{image_html}</div>
           {details}
         </div>
         """
@@ -546,31 +552,27 @@ def render_media_block(msg: Dict, render_mode: str) -> str:
         "document": "Document attached",
         "sticker": "Sticker attached",
         "gif": "GIF attached",
-        "attachment": "Attachment",
-    }.get(kind, "Attachment")
+        "attachment": "Attachment included",
+    }.get(kind, "Attachment included")
 
-    action_html = ""
     if render_mode == "html" and asset and kind not in {"voice", "audio"}:
         action_html = (
             f'<a class="attachment-link" href="{asset["relative_path"]}" target="_blank" rel="noopener">'
             f'Open file</a>'
         )
-    elif render_mode == "pdf_media" and asset and kind in {"voice", "audio", "video", "document", "attachment"}:
-        action_html = (
-            f'<a class="attachment-link" href="{asset["relative_path"]}" target="_blank" rel="noopener">'
-            f'Open externally</a>'
-        )
+    elif render_mode == "pdf_media":
+        action_html = '<div class="attachment-note">Open from media folder</div>'
+    else:
+        action_html = '<div class="attachment-note">Included as attachment record only</div>'
 
-    missing_note = ""
     if media.get("missing"):
-        missing_note = '<div class="attachment-note">Referenced file not found in export ZIP.</div>'
+        action_html = '<div class="attachment-note">Referenced file not found in export ZIP.</div>'
 
     return f"""
     <div class="media-block">
       <div class="attachment-card">
         <div class="attachment-title">{html.escape(title)}</div>
         <div class="attachment-meta">{meta_line}</div>
-        {missing_note}
         {action_html}
       </div>
     </div>
@@ -585,21 +587,20 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
             chunks.append(
                 f"""
                 <div class="date-separator-wrap">
-                  <div class="date-separator">{html.escape(item["date"])}</div>
+                  <div class="date-separator">{html.escape(item['date'])}</div>
                 </div>
                 """
             )
             continue
 
         msg = item
-
         if msg["is_system"]:
             chunks.append(
                 f"""
                 <div class="system-wrap">
                   <div class="system-message">
-                    <div class="system-text">{format_message_html(msg["message"])}</div>
-                    <div class="system-time">{html.escape(msg["time"] or "")}</div>
+                    <div class="system-text">{format_message_html(msg['message'])}</div>
+                    <div class="system-time">{html.escape(msg['time'] or '')}</div>
                   </div>
                 </div>
                 """
@@ -607,17 +608,9 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
             continue
 
         side_class = "left" if msg["side"] == "left" else "right"
-        sender_html = (
-            f'<div class="sender">{html.escape(msg["sender"])}</div>'
-            if msg["sender"]
-            else ""
-        )
+        sender_html = f'<div class="sender">{html.escape(msg["sender"])}</div>' if msg["sender"] else ""
         media_html = render_media_block(msg, render_mode)
-        text_html = (
-            f'<div class="message-text">{format_message_html(msg["message"])}</div>'
-            if (msg.get("message") or "").strip()
-            else ""
-        )
+        text_html = f'<div class="message-text">{format_message_html(msg["message"])}</div>' if (msg.get("message") or "").strip() else ""
 
         chunks.append(
             f"""
@@ -626,7 +619,7 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
                 {sender_html}
                 {media_html}
                 {text_html}
-                <div class="meta">{html.escape(msg["time"] or "")}</div>
+                <div class="meta">{html.escape(msg['time'] or '')}</div>
               </div>
             </div>
             """
@@ -646,21 +639,15 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       size: A4;
       margin: 10mm 8mm 12mm 8mm;
     }}
-
-    * {{
-      box-sizing: border-box;
-    }}
-
+    * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
-                   "Segoe UI", Arial, sans-serif;
+      font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Segoe UI", Arial, sans-serif;
       background: #efeae2;
       color: #111827;
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }}
-
     .topbar {{
       background: #0f8f7d;
       color: white;
@@ -670,13 +657,11 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       border-radius: 10px;
       margin-bottom: 10px;
     }}
-
     .chat-card {{
       background: #f6f1ea;
       border-radius: 14px;
       padding: 10px;
     }}
-
     .chat-title {{
       background: white;
       border-radius: 12px;
@@ -689,18 +674,8 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       font-size: 13px;
       color: #374151;
     }}
-
-    .chat-title strong {{
-      color: #111827;
-      font-size: 14px;
-    }}
-
-    .date-separator-wrap,
-    .system-wrap {{
-      text-align: center;
-      margin: 10px 0;
-    }}
-
+    .chat-title strong {{ color: #111827; font-size: 14px; }}
+    .date-separator-wrap, .system-wrap {{ text-align: center; margin: 10px 0; }}
     .date-separator {{
       display: inline-block;
       background: #dbeafe;
@@ -710,7 +685,6 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       font-size: 12px;
       font-weight: 600;
     }}
-
     .system-message {{
       display: inline-block;
       max-width: 70%;
@@ -721,29 +695,10 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       font-size: 12px;
       line-height: 1.5;
     }}
-
-    .system-time {{
-      margin-top: 4px;
-      font-size: 10px;
-      color: #6b7280;
-    }}
-
-    .msg-row {{
-      display: flex;
-      margin: 7px 0;
-      width: 100%;
-      break-inside: avoid;
-      page-break-inside: avoid;
-    }}
-
-    .msg-row.left {{
-      justify-content: flex-start;
-    }}
-
-    .msg-row.right {{
-      justify-content: flex-end;
-    }}
-
+    .system-time {{ margin-top: 4px; font-size: 10px; color: #6b7280; }}
+    .msg-row {{ display: flex; margin: 7px 0; width: 100%; break-inside: avoid; page-break-inside: avoid; }}
+    .msg-row.left {{ justify-content: flex-start; }}
+    .msg-row.right {{ justify-content: flex-end; }}
     .bubble {{
       max-width: 76%;
       padding: 8px 10px 6px;
@@ -754,131 +709,32 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
       break-inside: avoid;
       page-break-inside: avoid;
     }}
-
-    .bubble.left {{
-      background: white;
-      border-top-left-radius: 4px;
-    }}
-
-    .bubble.right {{
-      background: #dcf8c6;
-      border-top-right-radius: 4px;
-    }}
-
-    .sender {{
-      font-size: 12px;
-      font-weight: 700;
-      margin-bottom: 4px;
-      color: #2563eb;
-    }}
-
-    .bubble.right .sender {{
-      color: #0f8f7d;
-    }}
-
-    .message-text {{
-      font-size: 13px;
-      color: #111827;
-      margin-top: 4px;
-    }}
-
-    .media-block {{
-      margin-top: 6px;
-    }}
-
-    .image-wrap {{
-      background: rgba(255,255,255,0.55);
-      border-radius: 10px;
-      overflow: hidden;
-      border: 1px solid rgba(15, 23, 42, 0.08);
-    }}
-
-    .chat-image {{
-      display: block;
-      width: 100%;
-      max-width: 100%;
-      height: auto;
-      max-height: 220mm;
-      object-fit: contain;
-      background: #f8fafc;
-    }}
-
-    .voice-card,
-    .attachment-card {{
-      background: rgba(255,255,255,0.55);
-      border: 1px solid rgba(15, 23, 42, 0.08);
-      border-radius: 10px;
-      padding: 10px;
-    }}
-
-    .voice-title,
-    .attachment-title {{
-      font-size: 12px;
-      font-weight: 700;
-      color: #111827;
-      margin-bottom: 6px;
-    }}
-
-    .voice-player {{
-      width: 100%;
-      max-width: 100%;
-    }}
-
-    .attachment-meta {{
-      font-size: 11px;
-      color: #475569;
-      margin-top: 6px;
-      line-height: 1.5;
-    }}
-
-    .attachment-note {{
-      font-size: 11px;
-      color: #b45309;
-      margin-top: 6px;
-    }}
-
-    .attachment-link {{
-      display: inline-block;
-      margin-top: 8px;
-      font-size: 11px;
-      color: #1d4ed8;
-      text-decoration: none;
-      font-weight: 600;
-    }}
-
-    .attachment-link:hover {{
-      text-decoration: underline;
-    }}
-
-    .missing-media {{
-      padding: 18px 14px;
-      text-align: center;
-      background: #fef2f2;
-      color: #b91c1c;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-
-    .meta {{
-      margin-top: 4px;
-      text-align: right;
-      font-size: 10px;
-      color: #6b7280;
-    }}
+    .bubble.left {{ background: white; border-top-left-radius: 4px; }}
+    .bubble.right {{ background: #dcf8c6; border-top-right-radius: 4px; }}
+    .sender {{ font-size: 12px; font-weight: 700; margin-bottom: 4px; color: #2563eb; }}
+    .bubble.right .sender {{ color: #0f8f7d; }}
+    .message-text {{ font-size: 13px; color: #111827; margin-top: 4px; }}
+    .media-block {{ margin-top: 6px; }}
+    .image-wrap {{ background: rgba(255,255,255,0.55); border-radius: 10px; overflow: hidden; border: 1px solid rgba(15, 23, 42, 0.08); }}
+    .chat-image {{ display: block; width: 100%; max-width: 100%; height: auto; max-height: 220mm; object-fit: contain; background: #f8fafc; }}
+    .voice-card, .attachment-card {{ background: rgba(255,255,255,0.55); border: 1px solid rgba(15, 23, 42, 0.08); border-radius: 10px; padding: 10px; }}
+    .voice-title, .attachment-title {{ font-size: 12px; font-weight: 700; color: #111827; margin-bottom: 6px; }}
+    .voice-player {{ width: 100%; max-width: 100%; }}
+    .attachment-meta {{ font-size: 11px; color: #475569; margin-top: 6px; line-height: 1.5; }}
+    .attachment-note {{ font-size: 11px; color: #475569; margin-top: 6px; }}
+    .attachment-link {{ display: inline-block; margin-top: 8px; font-size: 11px; color: #1d4ed8; text-decoration: none; font-weight: 600; }}
+    .attachment-link:hover {{ text-decoration: underline; }}
+    .missing-media {{ padding: 18px 14px; text-align: center; background: #fef2f2; color: #b91c1c; font-size: 12px; font-weight: 700; }}
+    .meta {{ margin-top: 4px; text-align: right; font-size: 10px; color: #6b7280; }}
   </style>
 </head>
 <body>
   <div class="topbar">WAChatPrint</div>
-
   <div class="chat-card">
     <div class="chat-title">
-      <div>
-        <strong>{html.escape(source_name)}</strong><br />
-        <span>{html.escape(export_label)}</span>
-      </div>
+      <div><strong>{html.escape(source_name)}</strong><br /><span>{html.escape(export_label)}</span></div>
       <div>Part {chunk_no} of {total_chunks}</div>
     </div>
-
     {chat_body}
   </div>
 </body>
@@ -886,32 +742,19 @@ def build_chat_html(source_name: str, items: List[Dict], chunk_no: int, total_ch
     """
 
 
-async def render_chunk_pdf(
-    browser,
-    source_name: str,
-    chunk: List[Dict],
-    chunk_no: int,
-    total_chunks: int,
-    render_mode: str,
-) -> bytes:
+async def render_chunk_pdf(browser, source_name: str, chunk: List[Dict], chunk_no: int, total_chunks: int, render_mode: str) -> bytes:
     html_content = build_chat_html(source_name, chunk, chunk_no, total_chunks, render_mode)
     page = await browser.new_page()
 
     try:
         await page.set_content(html_content, wait_until="load")
         await page.emulate_media(media="screen")
-        pdf_bytes = await page.pdf(
+        return await page.pdf(
             format="A4",
             print_background=True,
-            margin={
-                "top": "10mm",
-                "right": "8mm",
-                "bottom": "12mm",
-                "left": "8mm",
-            },
+            margin={"top": "10mm", "right": "8mm", "bottom": "12mm", "left": "8mm"},
             prefer_css_page_size=True,
         )
-        return pdf_bytes
     finally:
         await page.close()
 
@@ -923,21 +766,11 @@ async def build_pdf_bytes(source_name: str, items: List[Dict], render_mode: str)
     writer = PdfWriter()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
             total_chunks = len(chunks)
             for idx, chunk in enumerate(chunks, start=1):
-                pdf_bytes = await render_chunk_pdf(
-                    browser=browser,
-                    source_name=source_name,
-                    chunk=chunk,
-                    chunk_no=idx,
-                    total_chunks=total_chunks,
-                    render_mode=render_mode,
-                )
+                pdf_bytes = await render_chunk_pdf(browser, source_name, chunk, idx, total_chunks, render_mode)
                 reader = PdfReader(BytesIO(pdf_bytes))
                 for page in reader.pages:
                     writer.add_page(page)
@@ -950,20 +783,12 @@ async def build_pdf_bytes(source_name: str, items: List[Dict], render_mode: str)
 
 
 def build_html_zip_bytes(source_name: str, items: List[Dict], media_index: Dict[str, Dict]) -> bytes:
-    html_content = build_chat_html(
-        source_name=source_name,
-        items=items,
-        chunk_no=1,
-        total_chunks=1,
-        render_mode="html",
-    )
-
+    html_content = build_chat_html(source_name, items, 1, 1, "html")
     output = BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("index.html", html_content)
         for asset in media_index.values():
             zf.writestr(f"media/{asset['output_name']}", asset["bytes"])
-
     return output.getvalue()
 
 
@@ -973,13 +798,11 @@ def build_pdf_media_zip_bytes(source_name: str, pdf_bytes: bytes, media_index: D
         zf.writestr(f"{source_name}.pdf", pdf_bytes)
         for asset in media_index.values():
             zf.writestr(f"media/{asset['output_name']}", asset["bytes"])
-
     return output.getvalue()
 
 
 async def get_authenticated_user(request: Request):
     auth_header = request.headers.get("authorization", "")
-
     if not auth_header.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Login required.")
 
@@ -996,66 +819,30 @@ async def get_authenticated_user(request: Request):
 
     if response.status_code != 200:
         raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
-
     return response.json()
 
 
-async def get_user_profile(user_id: str):
+async def supabase_get(table: str, params: dict):
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/user_profiles",
-            params={
-                "id": f"eq.{user_id}",
-                "select": "plan,max_file_size_mb,daily_conversion_limit",
-            },
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            params=params,
             headers={
                 "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
             },
         )
-
     if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Could not read plan profile.")
-
-    rows = response.json()
-    if not rows:
-        return {
-            "plan": "free",
-            "max_file_size_mb": 5,
-            "daily_conversion_limit": 2,
-        }
-
-    return rows[0]
+        raise HTTPException(status_code=500, detail=f"Could not read {table}.")
+    return response.json()
 
 
-async def get_usage_count_last_24h(user_id: str) -> int:
-    since = datetime.now(timezone.utc) - timedelta(days=1)
-
+async def supabase_patch(table: str, filters: dict, payload: dict):
     async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/conversion_usage",
-            params={
-                "user_id": f"eq.{user_id}",
-                "created_at": f"gte.{since.isoformat()}",
-                "select": "id",
-            },
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            },
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Could not read usage history.")
-
-    return len(response.json())
-
-
-async def record_usage_event(user_id: str):
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            f"{SUPABASE_URL}/rest/v1/conversion_usage",
-            json={"user_id": user_id},
+        response = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            params=filters,
+            json=payload,
             headers={
                 "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -1063,9 +850,284 @@ async def record_usage_event(user_id: str):
                 "Prefer": "return=minimal",
             },
         )
+    if response.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=f"Could not update {table}.")
 
+
+async def supabase_insert(table: str, payload: dict):
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            json=payload,
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
     if response.status_code not in (200, 201, 204):
-        raise HTTPException(status_code=500, detail="Could not record usage.")
+        raise HTTPException(status_code=500, detail=f"Could not insert into {table}.")
+
+
+async def get_user_profile(user_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "id": f"eq.{user_id}",
+            "select": "plan,max_file_size_mb,daily_conversion_limit,stripe_customer_id,stripe_subscription_id,subscription_status,current_period_end",
+        },
+    )
+
+    if not rows:
+        return {
+            "plan": "free",
+            "max_file_size_mb": FREE_PLAN_LIMIT_MB,
+            "daily_conversion_limit": FREE_PLAN_DAILY_LIMIT,
+            "stripe_customer_id": None,
+            "stripe_subscription_id": None,
+            "subscription_status": "inactive",
+            "current_period_end": None,
+        }
+
+    return rows[0]
+
+
+async def get_profile_by_customer_id(customer_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "stripe_customer_id": f"eq.{customer_id}",
+            "select": "id",
+        },
+    )
+    return rows[0] if rows else None
+
+
+async def get_profile_by_subscription_id(subscription_id: str):
+    rows = await supabase_get(
+        "user_profiles",
+        {
+            "stripe_subscription_id": f"eq.{subscription_id}",
+            "select": "id",
+        },
+    )
+    return rows[0] if rows else None
+
+
+async def get_usage_count_last_24h(user_id: str) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    rows = await supabase_get(
+        "conversion_usage",
+        {
+            "user_id": f"eq.{user_id}",
+            "created_at": f"gte.{since.isoformat()}",
+            "select": "id",
+        },
+    )
+    return len(rows)
+
+
+async def build_usage_summary(user_id: str):
+    profile = await get_user_profile(user_id)
+    used_last_24h = await get_usage_count_last_24h(user_id)
+    daily_limit = int(profile["daily_conversion_limit"])
+
+    return {
+        "plan": profile["plan"],
+        "max_file_size_mb": int(profile["max_file_size_mb"]),
+        "daily_conversion_limit": daily_limit,
+        "used_last_24h": int(used_last_24h),
+        "remaining_today": max(daily_limit - int(used_last_24h), 0),
+        "subscription_status": profile.get("subscription_status") or "inactive",
+        "current_period_end": profile.get("current_period_end"),
+    }
+
+
+async def record_usage_event(user_id: str):
+    await supabase_insert("conversion_usage", {"user_id": user_id})
+
+
+def pro_profile_payload(subscription_status: str, stripe_customer_id: Optional[str], stripe_subscription_id: Optional[str], current_period_end: Optional[str]):
+    return {
+        "plan": "pro",
+        "max_file_size_mb": PRO_PLAN_LIMIT_MB,
+        "daily_conversion_limit": PRO_PLAN_DAILY_LIMIT,
+        "stripe_customer_id": stripe_customer_id,
+        "stripe_subscription_id": stripe_subscription_id,
+        "subscription_status": subscription_status,
+        "current_period_end": current_period_end,
+    }
+
+
+def free_profile_payload(subscription_status: str, stripe_customer_id: Optional[str], current_period_end: Optional[str]):
+    return {
+        "plan": "free",
+        "max_file_size_mb": FREE_PLAN_LIMIT_MB,
+        "daily_conversion_limit": FREE_PLAN_DAILY_LIMIT,
+        "stripe_customer_id": stripe_customer_id,
+        "stripe_subscription_id": None,
+        "subscription_status": subscription_status,
+        "current_period_end": current_period_end,
+    }
+
+
+def to_iso_from_unix(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+@app.get("/usage-summary")
+async def usage_summary(request: Request):
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_SERVICE_ROLE_KEY:
+            raise HTTPException(status_code=500, detail="Backend pricing config is missing.")
+
+        user = await get_authenticated_user(request)
+        return await build_usage_summary(user["id"])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(request: Request):
+    try:
+        if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID_PRO_MONTHLY:
+            raise HTTPException(status_code=500, detail="Stripe config is missing.")
+
+        user = await get_authenticated_user(request)
+        profile = await get_user_profile(user["id"])
+
+        if profile.get("subscription_status") in ("active", "trialing", "past_due"):
+            raise HTTPException(status_code=400, detail="You already have an active paid plan. Use Manage Billing.")
+
+        params = {
+            "mode": "subscription",
+            "success_url": f"{APP_BASE_URL}/billing-success.html?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{APP_BASE_URL}/billing-cancel.html",
+            "line_items": [{"price": STRIPE_PRICE_ID_PRO_MONTHLY, "quantity": 1}],
+            "client_reference_id": user["id"],
+            "metadata": {
+                "user_id": user["id"],
+                "email": user.get("email", ""),
+                "product": "WAChatPrint Pro",
+            },
+            "subscription_data": {"metadata": {"user_id": user["id"]}},
+            "allow_promotion_codes": True,
+        }
+
+        if profile.get("stripe_customer_id"):
+            params["customer"] = profile["stripe_customer_id"]
+        else:
+            params["customer_email"] = user.get("email", "")
+
+        session = await asyncio.to_thread(stripe.checkout.Session.create, **params)
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/create-portal-session")
+async def create_portal_session(request: Request):
+    try:
+        if not STRIPE_SECRET_KEY:
+            raise HTTPException(status_code=500, detail="Stripe config is missing.")
+
+        user = await get_authenticated_user(request)
+        profile = await get_user_profile(user["id"])
+
+        if not profile.get("stripe_customer_id"):
+            raise HTTPException(status_code=400, detail="No billing profile found yet. Upgrade first.")
+
+        session = await asyncio.to_thread(
+            stripe.billing_portal.Session.create,
+            customer=profile["stripe_customer_id"],
+            return_url=f"{APP_BASE_URL}/dashboard.html",
+        )
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    try:
+        if not STRIPE_WEBHOOK_SECRET:
+            raise HTTPException(status_code=500, detail="Stripe webhook secret is missing.")
+
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature")
+        event = await asyncio.to_thread(stripe.Webhook.construct_event, payload, sig_header, STRIPE_WEBHOOK_SECRET)
+
+        event_type = event["type"]
+        obj = event["data"]["object"]
+
+        if event_type == "checkout.session.completed" and obj.get("mode") == "subscription":
+            user_id = obj.get("client_reference_id") or obj.get("metadata", {}).get("user_id")
+            if user_id:
+                await supabase_patch(
+                    "user_profiles",
+                    {"id": f"eq.{user_id}"},
+                    pro_profile_payload(
+                        subscription_status="active",
+                        stripe_customer_id=obj.get("customer"),
+                        stripe_subscription_id=obj.get("subscription"),
+                        current_period_end=None,
+                    ),
+                )
+
+        elif event_type == "customer.subscription.updated":
+            sub_id = obj.get("id")
+            customer_id = obj.get("customer")
+            status = obj.get("status")
+            period_end = to_iso_from_unix(obj.get("current_period_end"))
+
+            profile = await get_profile_by_subscription_id(sub_id)
+            if not profile and customer_id:
+                profile = await get_profile_by_customer_id(customer_id)
+
+            if profile:
+                if status in ("active", "trialing", "past_due"):
+                    await supabase_patch(
+                        "user_profiles",
+                        {"id": f"eq.{profile['id']}"},
+                        pro_profile_payload(status, customer_id, sub_id, period_end),
+                    )
+                else:
+                    await supabase_patch(
+                        "user_profiles",
+                        {"id": f"eq.{profile['id']}"},
+                        free_profile_payload(status or "inactive", customer_id, period_end),
+                    )
+
+        elif event_type == "customer.subscription.deleted":
+            sub_id = obj.get("id")
+            customer_id = obj.get("customer")
+            period_end = to_iso_from_unix(obj.get("current_period_end"))
+
+            profile = await get_profile_by_subscription_id(sub_id)
+            if not profile and customer_id:
+                profile = await get_profile_by_customer_id(customer_id)
+
+            if profile:
+                await supabase_patch(
+                    "user_profiles",
+                    {"id": f"eq.{profile['id']}"},
+                    free_profile_payload("canceled", customer_id, period_end),
+                )
+
+        return {"received": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 def export_response(file_bytes: bytes, filename: str, media_type: str):
@@ -1090,24 +1152,18 @@ async def generate_export(request: Request, file: UploadFile, export_format: str
         raise HTTPException(status_code=400, detail="Current system max is 50 MB.")
 
     user = await get_authenticated_user(request)
-    profile = await get_user_profile(user["id"])
-    used_today = await get_usage_count_last_24h(user["id"])
+    usage = await build_usage_summary(user["id"])
 
-    max_bytes = int(profile["max_file_size_mb"]) * 1024 * 1024
-    daily_limit = int(profile["daily_conversion_limit"])
-    plan_name = profile["plan"]
+    max_bytes = int(usage["max_file_size_mb"]) * 1024 * 1024
+    daily_limit = int(usage["daily_conversion_limit"])
+    used_today = int(usage["used_last_24h"])
+    plan_name = usage["plan"]
 
     if len(content) > max_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{plan_name.capitalize()} plan limit is {profile['max_file_size_mb']} MB."
-        )
+        raise HTTPException(status_code=400, detail=f"{plan_name.capitalize()} plan limit is {usage['max_file_size_mb']} MB.")
 
     if used_today >= daily_limit:
-        raise HTTPException(
-            status_code=403,
-            detail=f"{plan_name.capitalize()} plan limit reached: {daily_limit} conversions per 24 hours."
-        )
+        raise HTTPException(status_code=403, detail=f"{plan_name.capitalize()} plan limit reached: {daily_limit} conversions per 24 hours.")
 
     source_name, text, media_index = extract_chat_bundle(filename, content)
     items = enrich_messages_with_media(parse_whatsapp_text(text), media_index)
@@ -1118,37 +1174,21 @@ async def generate_export(request: Request, file: UploadFile, export_format: str
     if export_format == "html_zip":
         export_bytes = build_html_zip_bytes(source_name, items, media_index)
         await record_usage_event(user["id"])
-        return export_response(
-            file_bytes=export_bytes,
-            filename=f"{source_name}-interactive-html.zip",
-            media_type="application/zip",
-        )
+        return export_response(export_bytes, f"{source_name}-interactive-html.zip", "application/zip")
 
     if export_format == "pdf_media_zip":
         pdf_bytes = await build_pdf_bytes(source_name, items, render_mode="pdf_media")
         export_bytes = build_pdf_media_zip_bytes(source_name, pdf_bytes, media_index)
         await record_usage_event(user["id"])
-        return export_response(
-            file_bytes=export_bytes,
-            filename=f"{source_name}-pdf-media.zip",
-            media_type="application/zip",
-        )
+        return export_response(export_bytes, f"{source_name}-pdf-media.zip", "application/zip")
 
     pdf_bytes = await build_pdf_bytes(source_name, items, render_mode="pdf")
     await record_usage_event(user["id"])
-    return export_response(
-        file_bytes=pdf_bytes,
-        filename=f"{source_name}.pdf",
-        media_type="application/pdf",
-    )
+    return export_response(pdf_bytes, f"{source_name}.pdf", "application/pdf")
 
 
 @app.post("/export-chat")
-async def export_chat(
-    request: Request,
-    file: UploadFile = File(...),
-    export_format: str = Form("pdf"),
-):
+async def export_chat(request: Request, file: UploadFile = File(...), export_format: str = Form("pdf")):
     try:
         return await generate_export(request, file, export_format)
     except HTTPException:
