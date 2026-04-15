@@ -35,15 +35,6 @@ def to_iso(ts):
 
 
 def plan_payload_from_subscription(sub):
-    """
-    IMPORTANT:
-    If user cancels in Stripe portal, Stripe usually sets:
-    - status = active
-    - cancel_at_period_end = true
-
-    You said website should stop showing PRO immediately.
-    So here we downgrade immediately when cancel_at_period_end = true.
-    """
     status = getattr(sub, "status", None) or sub.get("status")
     cancel_at_period_end = getattr(sub, "cancel_at_period_end", None)
     if cancel_at_period_end is None and isinstance(sub, dict):
@@ -183,11 +174,7 @@ async def verify_checkout_session(request: Request):
         payload["stripe_customer_id"] = customer_id or payload.get("stripe_customer_id")
         payload["stripe_subscription_id"] = sub_id if payload["plan"] == "pro" else payload.get("stripe_subscription_id")
 
-        await supabase_patch(
-            "user_profiles",
-            {"id": f"eq.{user_id}"},
-            payload,
-        )
+        await supabase_patch("user_profiles", {"id": f"eq.{user_id}"}, payload)
 
         return {"success": True}
 
@@ -288,34 +275,21 @@ async def stripe_webhook(request: Request):
         sub_id = getattr(obj, "id", None)
         customer_id = getattr(obj, "customer", None)
 
-        rows = await supabase_get(
-            "user_profiles",
-            {"stripe_customer_id": f"eq.{customer_id}", "select": "id"},
-        )
+        rows = await supabase_get("user_profiles", {"stripe_customer_id": f"eq.{customer_id}", "select": "id"})
 
         if not rows and sub_id:
-            rows = await supabase_get(
-                "user_profiles",
-                {"stripe_subscription_id": f"eq.{sub_id}", "select": "id"},
-            )
+            rows = await supabase_get("user_profiles", {"stripe_subscription_id": f"eq.{sub_id}", "select": "id"})
 
         if rows:
             user_id = rows[0]["id"]
             payload = plan_payload_from_subscription(obj)
             payload["stripe_customer_id"] = customer_id or payload.get("stripe_customer_id")
-            await supabase_patch(
-                "user_profiles",
-                {"id": f"eq.{user_id}"},
-                payload,
-            )
+            await supabase_patch("user_profiles", {"id": f"eq.{user_id}"}, payload)
 
     elif event["type"] == "invoice.payment_failed":
         customer_id = getattr(obj, "customer", None)
 
-        rows = await supabase_get(
-            "user_profiles",
-            {"stripe_customer_id": f"eq.{customer_id}", "select": "id"},
-        )
+        rows = await supabase_get("user_profiles", {"stripe_customer_id": f"eq.{customer_id}", "select": "id"})
 
         if rows:
             user_id = rows[0]["id"]
@@ -337,10 +311,7 @@ async def stripe_webhook(request: Request):
 async def usage_summary(request: Request):
     user = await get_user(request)
 
-    profile = await supabase_get(
-        "user_profiles",
-        {"id": f"eq.{user['id']}", "select": "*"},
-    )
+    profile = await supabase_get("user_profiles", {"id": f"eq.{user['id']}", "select": "*"})
 
     if not profile:
         return {
