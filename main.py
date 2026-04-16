@@ -222,8 +222,8 @@ def choose_txt_from_zip(zip_file: zipfile.ZipFile) -> str:
     return txt_files[0]
 
 
-def sanitize_rel_path(path: str) -> str:
-    path = path.replace("\\", "/").lstrip("/")
+def sanitize_rel_path(path) -> str:
+    path = str(path).replace("\\", "/").lstrip("/")
     parts = [p for p in Path(path).parts if p not in ("", ".", "..")]
     return "/".join(parts)
 
